@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    "boost",
+    "curl",
+    "gumbo",
+    "libzip",
+    "cpu-features"
+  ]
+}
