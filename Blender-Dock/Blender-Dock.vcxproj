@@ -144,11 +144,24 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Blender-Dock\network_client.cpp" />
+    <ClCompile Include="Blender-Dock\version_discovery.cpp" />
+    <ClCompile Include="Blender-Dock\version_parser.cpp" />
+    <ClCompile Include="config_manager.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="zip_extractor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.gitignore" />
     <None Include="..\README.md" />
+    <None Include="bpy\blender_assets.py" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Blender-Dock\network_client.h" />
+    <ClInclude Include="Blender-Dock\version_discovery.h" />
+    <ClInclude Include="Blender-Dock\version_parser.h" />
+    <ClInclude Include="config_manager.h" />
+    <ClInclude Include="zip_extractor.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

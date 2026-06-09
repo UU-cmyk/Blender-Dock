@@ -371,3 +371,4 @@ config/
 versions/
 
 .vscode/
+.venv/

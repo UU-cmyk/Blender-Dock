@@ -1,9 +1,10 @@
 {
   "dependencies": [
     "boost",
+    "cpu-features",
     "curl",
     "gumbo",
     "libzip",
-    "cpu-features"
+    "nlohmann-json"
   ]
 }
