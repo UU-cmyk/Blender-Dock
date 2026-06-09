@@ -8,16 +8,14 @@
 #include <map>
 #include <curl/curl.h>
 #include <gumbo.h>
+#include "Blender-Dock/version_parser.h"
+#include "Blender-Dock/version_discovery.h"
+#include "Blender-Dock/network_client.h"
 #include <thread>
 #include <mutex>
-#include <condition_variable>
-#include <queue>
 #include <fstream>
 #include <filesystem>
-#include <future>
 #include <atomic>
-#include <chrono>
-#include <boost/dll.hpp>
 #include <boost/program_options.hpp>
 #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86) || defined(__i386__)
 #include <cpu_features/cpuinfo_x86.h>
@@ -28,31 +26,19 @@
 #else
 // unknown architecture: do not include specific cpu_features headers
 #endif
-#include <boost/predef/os.h>
 #if BOOST_OS_WINDOWS
 #include <windows.h>
-#else
-#include <sys/utsname.h>
+#elif BOOST_OS_LINUX
+#include <unistd.h>
 #endif
+#include <boost/predef/os.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <zip.h>
+#include <nlohmann/json.hpp>
 
-/// <summary>
-/// 数据写入回调函数，该函数在 libcurl 接收到 HTTP 响应数据时被调用，用于将接收到的数据追加到用户提供的 std::string 缓冲区中
-/// </summary>
-/// <param name="ptr">libcurl 收到的数据缓冲区</param>
-/// <param name="size">每个数据块的大小</param>
-/// <param name="nmemb">数据块的数量</param>
-/// <param name="out">传入的自定义参数</param>
-/// <returns></returns>
-static size_t WriteCallback(void* ptr, size_t size, size_t nmemb, std::string* out)
-{
-	out->append(static_cast<char*>(ptr), size * nmemb);
-	return size * nmemb;
-}
-// Forward declare parse_version_numbers used below
+// 前向声明：下面会使用 parse_version_numbers
 static std::vector<int> parse_version_numbers(const std::string& s);
 
 // 按嵌入的版本号比较文件名 (例如 "blender-4.2.10-...")
@@ -94,29 +80,10 @@ static std::vector<int> parse_version_numbers(const std::string& s)
 	return parts;
 }
 
-// Compare version strings by numeric parts (ascending). If equal, fallback to string compare.
-static bool version_less_numeric(const std::string& a, const std::string& b)
-{
-	auto va = parse_version_numbers(a);
-	auto vb = parse_version_numbers(b);
-	size_t n = (va.size() > vb.size()) ? va.size() : vb.size();
-	for (size_t i = 0; i < n; ++i) {
-		int ai = i < va.size() ? va[i] : 0;
-		int bi = i < vb.size() ? vb[i] : 0;
-		if (ai < bi) return true;
-		if (ai > bi) return false;
-	}
-	return a < b;
-}
-
 // 从文件加载配置（简单密钥格式返回下载基目录
 // 简单的 JSON 配置加载器（无外部 JSON 依赖项）
 struct SimpleConfig {
-	std::filesystem::path download_dir;
 	unsigned int parallel = 0; // 0 表示自动（使用硬件并发）
-
-	std::filesystem::path addons_dir = "addons";
-	std::filesystem::path assets_dir = "assets";
 	bool auto_extract_addons = true;
 	bool auto_link_addons = false;  // 是否创建符号链接到Blender用户目录
 	std::string blender_user_dir = ""; // 自定义Blender用户目录路径
@@ -131,16 +98,19 @@ static std::string read_file_all(const std::filesystem::path& p)
 	return ss.str();
 }
 
+/// <summary>
+/// Writes the default configuration.
+/// </summary>
+/// <param name="cfgpath">The cfgpath.</param>
 static void write_default_config(const std::filesystem::path& cfgpath)
 {
 	try {
 		std::filesystem::create_directories(cfgpath.parent_path());
+		nlohmann::json j;
+		j["parallel_downloads"] = 0;
 		std::ofstream ofs(cfgpath, std::ios::trunc);
 		if (!ofs) return;
-		ofs << "{\n";
-		ofs << "  \"download_dir\": \"versions\",\n";
-		ofs << "  \"parallel_downloads\": 0\n";
-		ofs << "}\n";
+		ofs << j.dump(2) << std::endl;
 	}
 	catch (...) {}
 }
@@ -148,9 +118,6 @@ static void write_default_config(const std::filesystem::path& cfgpath)
 static SimpleConfig load_config_json(const std::string& cfgfile = "config/config.json")
 {
 	SimpleConfig cfg;
-	cfg.download_dir = std::filesystem::path("versions");
-	cfg.addons_dir = std::filesystem::path("addons");
-	cfg.assets_dir = std::filesystem::path("assets");
 	cfg.parallel = 0;
 	cfg.auto_extract_addons = true;
 	cfg.auto_link_addons = false;
@@ -164,51 +131,17 @@ static SimpleConfig load_config_json(const std::string& cfgfile = "config/config
 	std::string s = read_file_all(p);
 	if (s.empty()) return cfg;
 
-	// 粗略的 JSON 解析查找 "download_dir"
-	auto find_key = [&](const std::string& key) -> std::string {
-		size_t pos = s.find('"' + key + '"');
-		if (pos == std::string::npos) return std::string();
-		pos = s.find(':', pos);
-		if (pos == std::string::npos) return std::string();
-		pos++;
-		// skip spaces
-		while (pos < s.size() && isspace(static_cast<unsigned char>(s[pos]))) ++pos;
-		if (pos >= s.size()) return std::string();
-		if (s[pos] == '"') {
-			++pos;
-			size_t end = pos;
-			while (end < s.size() && s[end] != '"') ++end;
-			if (end <= s.size()) return s.substr(pos, end - pos);
-			return std::string();
-		}
-		else {
-			// number or literal
-			size_t end = pos;
-			while (end < s.size() && !isspace(static_cast<unsigned char>(s[end])) && s[end] != ',' && s[end] != '}') ++end;
-			return s.substr(pos, end - pos);
-		}
-		};
-
-	auto addons = find_key("addons_dir");
-	if (!addons.empty()) cfg.addons_dir = std::filesystem::path(addons);
-
-	auto assets = find_key("assets_dir");
-	if (!assets.empty()) cfg.assets_dir = std::filesystem::path(assets);
-
-	auto auto_extract = find_key("auto_extract_addons");
-	if (!auto_extract.empty()) cfg.auto_extract_addons = (auto_extract == "true");
-
-	auto auto_link = find_key("auto_link_addons");
-	if (!auto_link.empty()) cfg.auto_link_addons = (auto_link == "true");
-
-	auto dld = find_key("download_dir");
-	if (!dld.empty()) cfg.download_dir = std::filesystem::path(dld);
-
-	auto par = find_key("parallel_downloads");
-	if (!par.empty()) {
-		try { cfg.parallel = static_cast<unsigned int>(std::stoul(par)); }
-		catch (...) { cfg.parallel = 0; }
+	try {
+		auto j = nlohmann::json::parse(s);
+		if (j.contains("parallel_downloads") && j["parallel_downloads"].is_number_integer()) cfg.parallel = static_cast<unsigned int>(j["parallel_downloads"].get<int>());
+		if (j.contains("auto_extract_addons")) cfg.auto_extract_addons = j["auto_extract_addons"].get<bool>();
+		if (j.contains("auto_link_addons")) cfg.auto_link_addons = j["auto_link_addons"].get<bool>();
+		if (j.contains("blender_user_dir") && j["blender_user_dir"].is_string()) cfg.blender_user_dir = j["blender_user_dir"].get<std::string>();
 	}
+	catch (...) {
+		// failed to parse JSON, return defaults
+	}
+
 	return cfg;
 }
 
@@ -216,7 +149,6 @@ static SimpleConfig load_config_json(const std::string& cfgfile = "config/config
 static void ensure_workspace_structure()
 {
 	try {
-		std::filesystem::create_directories("bin");
 		std::filesystem::create_directories("config");
 		std::filesystem::create_directories("versions");
 		std::filesystem::create_directories("addons");
@@ -322,7 +254,13 @@ static int progress_func(void* /*clientp*/, curl_off_t dltotal, curl_off_t dlnow
 	return 0; // 返回非0将中止
 }
 
-// 下载文件到指定路径（覆盖）
+/// <summary>
+/// 下载文件到指定路径（覆盖）
+/// </summary>
+/// <param name="url">目标URL</param>
+/// <param name="out_path">目标路径</param>
+/// <param name="timeout_ms">The timeout ms.</param>
+/// <returns></returns>
 static bool download_file(const std::string& url, const std::filesystem::path& out_path, long timeout_ms = 0)
 {
 	std::ofstream ofs(out_path, std::ios::binary);
@@ -353,111 +291,6 @@ static bool download_file(const std::string& url, const std::filesystem::path& o
 }
 
 /// <summary>
-/// 下载 HTML，允许传入超时毫秒数（默认 15000 ms）
-/// </summary>
-/// <param name="url">目标网页地址（支持 HTTP / HTTPS）</param>
-/// <param name="html">用于接收响应内容的字符串</param>
-/// <returns></returns>
-static bool download_html(const std::string& url, std::string& html, long timeout_ms = 15000)
-{
-	CURL* curl = curl_easy_init();
-	if (!curl) return false;
-
-	html.clear();
-	curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &html);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-	// 使用毫秒级超时以更精确控制
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "Mozilla/5.0");
-
-	CURLcode res = curl_easy_perform(curl);
-	curl_easy_cleanup(curl);
-
-	return res == CURLE_OK;
-}
-
-/// <summary>
-/// 解析 Blender 大版本目录
-/// </summary>
-/// <param name="node">当前 Gumbo DOM 节点</param>
-/// <param name="out">用于存储提取到的版本目录名的字符串数组</param>
-static void parse_major_versions(GumboNode* node, std::vector<std::string>& out)
-{
-	if (node->type != GUMBO_NODE_ELEMENT) return;
-
-	if (node->v.element.tag == GUMBO_TAG_A)
-	{
-		GumboAttribute* href =
-			gumbo_get_attribute(&node->v.element.attributes, "href");
-
-		if (href)
-		{
-			std::string s = href->value;
-			if (s.find("Blender") == 0 && s.back() == '/')
-			{
-				s.pop_back();
-
-				// 过滤不需要输出的目录名：BlenderBenchmark, alpha, beta, trailing 'a'/'b'/'c', newpy
-				auto tolower_copy = [](const std::string& str) { std::string t; t.reserve(str.size()); for (char c : str) t.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c)))); return t; };
-				std::string low = tolower_copy(s);
-				bool exclude = false;
-				if (low.find("blenderbenchmark") != std::string::npos) exclude = true;
-				if (low.find("alpha") != std::string::npos) exclude = true;
-				if (low.find("beta") != std::string::npos) exclude = true;
-				if (low.find("newpy") != std::string::npos) exclude = true;
-				// 排除带后缀 a/b/c 的版本
-				if (!exclude && !s.empty()) {
-					char last = s.back();
-					if ((last == 'a' || last == 'A' || last == 'b' || last == 'B' || last == 'c' || last == 'C') && s.size() >= 2 && std::isdigit(static_cast<unsigned char>(s[s.size() - 2]))) {
-						exclude = true;
-					}
-				}
-
-				if (!exclude)
-					out.push_back(s);
-			}
-		}
-	}
-
-	auto* c = &node->v.element.children;
-	for (unsigned i = 0; i < c->length; ++i)
-		parse_major_versions(static_cast<GumboNode*>(c->data[i]), out);
-}
-
-/// <summary>
-/// 解析子目录中的下载文件
-/// </summary>
-/// <param name="node">当前 Gumbo DOM 节点</param>
-/// <param name="out">用于存储提取到的下载链接（自动去重）</param>
-static void parse_download_links(GumboNode* node, std::set<std::string>& out)
-{
-	if (node->type != GUMBO_NODE_ELEMENT) return;
-
-	if (node->v.element.tag == GUMBO_TAG_A)
-	{
-		GumboAttribute* href =
-			gumbo_get_attribute(&node->v.element.attributes, "href");
-
-		if (href)
-		{
-			std::string s = href->value;
-			if (s.ends_with(".zip") ||
-				s.ends_with(".tar.xz") ||
-				s.ends_with(".dmg"))
-			{
-				out.insert(s);
-			}
-		}
-	}
-
-	auto* c = &node->v.element.children;
-	for (unsigned i = 0; i < c->length; ++i)
-		parse_download_links(static_cast<GumboNode*>(c->data[i]), out);
-}
-
-/// <summary>
 /// 获取当前操作系统名称，使用 Boost.Predef 库进行检测，以便在输出系统信息时显示更友好的名称
 /// </summary>
 /// <returns>返回操作系统名称</returns>
@@ -478,183 +311,41 @@ static std::string get_system_name()
 }
 
 /// <summary>
-/// 根据当前操作系统过滤可用的Blender安装包
-/// </summary>
-/// <param name="files">所有文件集合</param>
-/// <returns>返回过滤后的文件集合</returns>
-static std::vector<std::string> filter_by_system(const std::set<std::string>& files)
-{
-	std::vector<std::string> available;
-
-	// helper: get normalized architecture string: "x86_64", "x86", "arm64", "armv7", etc.
-	auto get_arch = []() -> std::string {
-#if BOOST_OS_WINDOWS
-		SYSTEM_INFO si;
-		GetNativeSystemInfo(&si);
-		switch (si.wProcessorArchitecture) {
-		case PROCESSOR_ARCHITECTURE_AMD64: return "x86_64";
-		case PROCESSOR_ARCHITECTURE_INTEL: return "x86";
-		case PROCESSOR_ARCHITECTURE_ARM64: return "arm64";
-		case PROCESSOR_ARCHITECTURE_ARM: return "arm";
-		default: return "unknown";
-		}
-#else
-		struct utsname u;
-		if (uname(&u) != 0) return "unknown";
-		std::string m(u.machine);
-		std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-		if (m.find("aarch64") != std::string::npos || m.find("arm64") != std::string::npos) return "arm64";
-		if (m.find("armv7") != std::string::npos || m.find("armv6") != std::string::npos || m.find("arm") != std::string::npos) return "arm";
-		if (m.find("x86_64") != std::string::npos || m.find("amd64") != std::string::npos) return "x86_64";
-		if (m.find("86") != std::string::npos || m.find("i386") != std::string::npos) return "x86";
-		return "unknown";
-#endif
-		};
-
-	auto arch = get_arch();
-
-	auto filename_matches_arch = [&](const std::string& name_lower) -> bool {
-		// detect architecture hints in filename
-		if (name_lower.find("arm64") != std::string::npos || name_lower.find("aarch64") != std::string::npos) {
-			return arch == "arm64";
-		}
-		if (name_lower.find("armv7") != std::string::npos || name_lower.find("armv6") != std::string::npos || name_lower.find("armhf") != std::string::npos || name_lower.find("arm") != std::string::npos) {
-			return arch == "arm" || arch == "arm64";
-		}
-		if (name_lower.find("win64") != std::string::npos || name_lower.find("linux64") != std::string::npos || name_lower.find("x86_64") != std::string::npos || name_lower.find("amd64") != std::string::npos) {
-			return arch == "x86_64" || arch == "arm64"; // arm64 systems may run amd64 binaries on some platforms (e.g. Windows via emulation), include arm64 too
-		}
-		if (name_lower.find("win32") != std::string::npos || name_lower.find("i386") != std::string::npos || name_lower.find("x86") != std::string::npos) {
-			return arch == "x86" || arch == "x86_64";
-		}
-		// no arch hint -> assume generic
-		return true;
-		};
-	for (const auto& f : files)
-	{
-		// 检查文件名是否与当前架构匹配
-		std::string lower = f;
-		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-		// 如果当前是 Windows 或 Linux，过滤掉文件名中包含 "osx" 的压缩包
-#if defined(BOOST_OS_WINDOWS) || defined(BOOST_OS_LINUX)
-		if (lower.find("osx") != std::string::npos)
-			continue;
-#endif
-		// 排除表示 alpha/beta/rc 或 版本后缀 a/b/c 的文件名后缀（在去掉 "blender" 之后）
-		{
-			std::string probe = lower;
-			// remove occurrences of "blender" to avoid false positives
-			size_t pos = 0;
-			while ((pos = probe.find("blender", pos)) != std::string::npos) {
-				probe.erase(pos, 7);
-			}
-			// check for "rc"
-			if (probe.find("rc") != std::string::npos ||
-				probe.find("preview") != std::string::npos ||
-				probe.find("alpha") != std::string::npos ||
-				probe.find("beta") != std::string::npos ||
-				probe.find("add-ons-legacy-bundle") != std::string::npos) continue;
-			// check for pattern: digit followed immediately by a/b/c
-			bool foundSuffix = false;
-			for (size_t i = 1; i < probe.size(); ++i) {
-				if (std::isdigit(static_cast<unsigned char>(probe[i - 1]))) {
-					char c = probe[i];
-					if (c == 'a' || c == 'b' || c == 'c') { foundSuffix = true; break; }
-				}
-			}
-			if (foundSuffix) continue;
-		}
-		if (!filename_matches_arch(lower)) continue;
-
-		if (BOOST_OS_WINDOWS) {
-			// Windows: 支持 .exe, .msi, .zip
-			if (f.ends_with(".zip")) {
-				available.push_back(f);
-			}
-		}
-		if (BOOST_OS_LINUX) {
-			// Linux: 支持 .tar.xz
-			if (f.ends_with(".tar.xz") || f.ends_with(".zip")) {
-				available.push_back(f);
-			}
-		}
-		if (BOOST_OS_MACOS) {
-			// macOS: 支持 .dmg 和 .zip
-			if (f.ends_with(".dmg") || f.ends_with(".zip")) {
-				available.push_back(f);
-			}
-		}
-	}
-
-	return available;
-}
-
-/// <summary>
-/// 解析并显示可用版本信息
-/// </summary>
-/// <param name="versions">版本</param>
-static void display_available_versions(const std::map<std::string, std::vector<std::string>>& versions)
-{
-	std::cout << "\n========== Available Blender Versions for ";
-	std::cout << get_system_name() << " ==========\n\n";
-
-	for (const auto& [version, files] : versions)
-	{
-		if (!files.empty())
-		{
-			std::cout << "Blender " << version << ":\n";
-			for (const auto& file : files)
-			{
-				std::cout << "  - " << file << "\n";
-			}
-			std::cout << "\n";
-		}
-	}
-}
-
-/// <summary>
-/// 智能推荐最佳版本
-/// </summary>
-/// <param name="versions">版本</param>
-static void recommend_best_version(const std::map<std::string, std::vector<std::string>>& versions)
-{
-	if (versions.empty()) return;
-	// pick latest by numeric version ordering
-	std::vector<std::string> keys;
-	for (const auto& kv : versions) keys.push_back(kv.first);
-	std::sort(keys.begin(), keys.end(), version_less_numeric);
-	auto latest = keys.empty() ? std::string() : keys.back();
-	if (!latest.empty() && !versions.at(latest).empty())
-	{
-		std::cout << "⭐ 建议：最新稳定版本是Blender ";
-		std::cout << latest << "\n";
-		std::cout << "   Download: " << versions.at(latest)[0] << "\n";
-		std::cout << "   URL: https://download.blender.org/release/Blender";
-		std::cout << latest << "/" << versions.at(latest)[0] << "\n\n";
-	}
-}
-
-/// <summary>
 /// 输出系统信息
 /// </summary>
 static void print_sys_info()
 {
-	auto info = cpu_features::GetX86Info();
-
 	std::cout << "========== 系统信息 ==========\n";
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86) || defined(__i386__)
+	const auto info = cpu_features::GetX86Info();
+
 	std::cout << "Vendor: " << info.vendor << "\n";
 	std::cout << "Family: " << info.family << "\n";
 	std::cout << "Model:  " << info.model << "\n";
 	std::cout << "System: " << get_system_name() << "\n";
 
-	// 显示CPU特性
-	if (info.features.avx2) {
-		std::cout << "AVX2 supported ✓\n";
-	}
-	if (info.features.avx) {
-		std::cout << "AVX supported ✓\n";
-	}
+	if (info.features.avx2) std::cout << "AVX2 supported ✓\n";
+	if (info.features.avx) std::cout << "AVX supported ✓\n";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+	const auto info = cpu_features::GetArmInfo();
+
+	std::cout << "Architecture: ARM64\n";
+	if (info.features.asimd) std::cout << "ASIMD supported ✓\n";
+	if (info.features.neon)  std::cout << "NEON supported ✓\n";
+	if (info.features.crc32) std::cout << "CRC32 supported ✓\n";
+#elif defined(__arm__) || defined(_M_ARM)
+	const auto info = cpu_features::GetArmInfo();
+
+	std::cout << "Architecture: ARM32\n";
+	if (info.features.neon) std::cout << "NEON supported ✓\n";
+#elif defined(__powerpc__) || defined(__ppc__)
+	const auto info = cpu_features::GetPowerpcInfo();
+
+	std::cout << "Architecture: PowerPC\n";
+	if (info.features.altivec) std::cout << "AltiVec supported ✓\n";
+#endif
+
+	std::cout << "System: " << get_system_name() << "\n";
 	std::cout << "========================================\n\n";
 }
 
@@ -669,11 +360,14 @@ int main(int argc, char** argv)
 	po::options_description desc("Allowed options");
 	desc.add_options()
 		("help,h", "show help")
+		("assets", po::value<std::vector<std::string>>()->multitoken(), "manage Blender asset libraries: add/remove/modify/list (passed to bpy/blender_assets.py)")
+		("config", po::value<std::vector<std::string>>()->multitoken(), "configure settings: e.g. --config download parallel_downloads=4")
 		("show-all-ver", "list major versions")
 		("show-small-ver", po::value<std::string>(), "list files for a major version (e.g. 3.6 or Blender3.6)")
 		("download", po::value<std::string>(), "download file name or URL")
 		("name", po::value<std::string>(), "custom name for extracted folder")
-		("start", po::value<std::string>(), "start Blender installation (folder name or partial)");
+		("start", po::value<std::string>(), "start Blender installation (folder name or partial)")
+		("list-installed", "list installed Blender versions under the local versions directory");
 	po::variables_map vm;
 	try {
 		po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -695,96 +389,248 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	std::string html;
-	if (!download_html("https://download.blender.org/release/", html, 8000))
-	{
-		std::cerr << "获取主索引失败\n";
-		curl_global_cleanup();
-		return 1;
-	}
-
-	GumboOutput* root = gumbo_parse(html.c_str());
-	std::vector<std::string> majors;
-	parse_major_versions(root->root, majors);
-	gumbo_destroy_output(&kGumboDefaultOptions, root);
-
-	// majors discovered (silent)
-
-	// 存储每个版本的可用文件
-	std::map<std::string, std::vector<std::string>> available_versions;
-
-	// 并行抓取每个大版本，保证在 5 秒内完成（总体预算）
-	const auto start_time = std::chrono::steady_clock::now();
-	const std::chrono::milliseconds budget(5000);
-
-	std::vector<std::future<std::pair<std::string, std::vector<std::string>>>> futures;
-	for (const auto& ver : majors)
-	{
-		futures.emplace_back(std::async(std::launch::async, [ver, start_time, budget]() -> std::pair<std::string, std::vector<std::string>> {
-			std::pair<std::string, std::vector<std::string>> result;
-			result.first = ver;
-
-			// 计算剩余时间
-			auto now = std::chrono::steady_clock::now();
-			long long remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time + budget - now).count();
-			if (remaining_ms <= 0) return result;
-
-			std::string url = "https://download.blender.org/release/" + ver + "/";
-			std::string sub_html;
-			// 每个请求使用剩余时间的上限，但不超过 3000ms
-			long timeout = static_cast<long>(std::min<long long>(remaining_ms, 3000LL));
-			if (!download_html(url, sub_html, timeout))
-			{
-				// 失败或超时
-				return result;
-			}
-
-			GumboOutput* sub = gumbo_parse(sub_html.c_str());
-			std::set<std::string> files;
-			parse_download_links(sub->root, files);
-			gumbo_destroy_output(&kGumboDefaultOptions, sub);
-
-			// 根据系统过滤文件
-			auto system_files = filter_by_system(files);
-			result.second = std::move(system_files);
-			return result;
-			}));
-	}
-
-	// Collect results, but stop respecting the 5s budget
-	for (auto& f : futures)
-	{
-		// 计算剩余时间
-		auto now = std::chrono::steady_clock::now();
-		long long remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time + budget - now).count();
-		if (remaining_ms <= 0)
-		{
-			std::cerr << "Time budget exceeded while gathering links\n";
-			break;
-		}
-
-		// 等待带超时
-		if (f.wait_for(std::chrono::milliseconds(remaining_ms)) == std::future_status::ready)
-		{
-			auto p = f.get();
-			if (!p.second.empty())
-			{
-				available_versions[p.first] = p.second;
-			}
-		}
-		else
-		{
-			std::cerr << "Future timed out for a version\n";
-		}
-	}
-
 	// Ensure workspace and load config
 	ensure_workspace_structure();
 	SimpleConfig cfg = load_config_json();
 
+	// --config: configuration modifications (e.g. --config download parallel_downloads=4)
+	if (vm.count("config")) {
+		auto& vals = vm["config"].as<std::vector<std::string>>();
+		if (vals.empty()) {
+			std::cerr << "--config requires arguments, e.g. --config download parallel_downloads=4\n";
+			curl_global_cleanup();
+			return 1;
+		}
+		std::string section = vals[0];
+		if (section == "download") {
+			int new_parallel = -1;
+			for (size_t i = 1; i < vals.size(); ++i) {
+				const std::string& tok = vals[i];
+				const std::string key = "parallel_downloads=";
+				if (tok.rfind(key, 0) == 0) {
+					std::string num = tok.substr(key.size());
+					try { new_parallel = std::stoi(num); }
+					catch (...) { new_parallel = -1; }
+				}
+			}
+			if (new_parallel < 0) {
+				std::cerr << "Invalid or missing parallel_downloads value. Usage: --config download parallel_downloads=4\n";
+				curl_global_cleanup();
+				return 1;
+			}
+
+			// read config file
+			std::filesystem::path cfgpath = std::filesystem::path("config") / "config.json";
+			std::string s = read_file_all(cfgpath);
+			if (s.empty()) {
+				// create default then read again
+				write_default_config(cfgpath);
+				s = read_file_all(cfgpath);
+			}
+			if (s.empty()) s = "{}";
+
+			// locate existing key
+			std::string keyname = "\"parallel_downloads\"";
+			size_t pos = s.find(keyname);
+			if (pos != std::string::npos) {
+				size_t colon = s.find(':', pos);
+				if (colon != std::string::npos) {
+					size_t valstart = colon + 1;
+					// skip spaces
+					while (valstart < s.size() && isspace(static_cast<unsigned char>(s[valstart]))) ++valstart;
+					size_t valend = valstart;
+					while (valend < s.size() && (std::isdigit(static_cast<unsigned char>(s[valend])) || s[valend] == '-')) ++valend;
+					s.replace(valstart, valend - valstart, std::to_string(new_parallel));
+				}
+			}
+			else {
+				// insert before final }
+				size_t brace = s.rfind('}');
+				std::string insert = "  \"parallel_downloads\": " + std::to_string(new_parallel) + "\n";
+				if (brace != std::string::npos) {
+					// ensure proper comma handling: if preceding non-space before brace is not '{', add comma
+					size_t prev = brace;
+					while (prev > 0 && isspace(static_cast<unsigned char>(s[prev - 1]))) --prev;
+					if (prev > 0 && s[prev - 1] != '{' && s[prev - 1] != ',') insert = ",\n" + insert;
+					s.insert(brace, insert);
+				}
+				else {
+					s = "{\n" + insert + "}\n";
+				}
+			}
+
+			// write back
+			try {
+				std::filesystem::create_directories(cfgpath.parent_path());
+				std::ofstream ofs(cfgpath, std::ios::trunc);
+				if (!ofs) {
+					std::cerr << "Failed to open config file for writing: " << cfgpath.string() << "\n";
+					curl_global_cleanup();
+					return 1;
+				}
+				ofs << s;
+				ofs.close();
+				std::cout << "Updated config: " << cfgpath.string() << " (parallel_downloads=" << new_parallel << ")\n";
+			}
+			catch (const std::exception& ex) {
+				std::cerr << "Failed to write config: " << ex.what() << "\n";
+				curl_global_cleanup();
+				return 1;
+			}
+
+			// reload cfg
+			cfg = load_config_json(cfgpath.string());
+			curl_global_cleanup();
+			return 0;
+		}
+
+		else {
+			std::cerr << "Unknown config section: " << section << "\n";
+			curl_global_cleanup();
+			return 1;
+		}
+	}
+
+	// --list-installed: 列出本地 versions 目录下已安装的 Blender
+	if (vm.count("list-installed")) {
+		// determine exe_dir and versions dir
+		std::filesystem::path exe_dir;
+		try {
+#if BOOST_OS_WINDOWS
+			char buf[MAX_PATH];
+			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+			else exe_dir = std::filesystem::current_path();
+#else
+			char buf[4096];
+			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+			if (len > 0) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+			else exe_dir = std::filesystem::current_path();
+#endif
+		}
+		catch (...) { exe_dir = std::filesystem::current_path(); }
+
+		std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
+		if (!std::filesystem::exists(versions_dir)) {
+			std::cout << "Versions directory not found: " << versions_dir.string() << "\n";
+			curl_global_cleanup();
+			return 0;
+		}
+
+		std::cout << "Installed Blender versions under: " << versions_dir.string() << "\n";
+		for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
+			if (!e.is_directory()) continue;
+			std::string name = e.path().filename().string();
+			std::filesystem::path inst = e.path();
+			// locate blender executable
+			std::filesystem::path exe_path;
+#if BOOST_OS_WINDOWS
+			std::vector<std::string> look = { "blender.exe", "bin\\blender.exe" };
+			for (auto& s : look) {
+				std::filesystem::path p = inst / s;
+				if (std::filesystem::exists(p)) { exe_path = p; break; }
+			}
+#else
+			std::vector<std::string> look = { "blender", "./blender", "bin/blender" };
+			for (auto& s : look) {
+				std::filesystem::path p = inst / s;
+				if (std::filesystem::exists(p)) { exe_path = p; break; }
+			}
+#endif
+			std::cout << " - " << name << " -> " << inst.string();
+			if (!exe_path.empty()) std::cout << " (executable: " << exe_path.string() << ")";
+			else std::cout << " (no executable found)";
+			std::cout << "\n";
+		}
+
+		curl_global_cleanup();
+		return 0;
+	}
+
+	// --assets: manage Blender asset libraries by invoking the bundled bpy/blender_assets.py
+	if (vm.count("assets")) {
+		auto& vals = vm["assets"].as<std::vector<std::string>>();
+		if (vals.empty()) {
+			std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
+			curl_global_cleanup();
+			return 1;
+		}
+
+		// locate script: try executable dir and current working dir
+		std::filesystem::path script_path;
+		std::filesystem::path exe_dir;
+		try {
+#if BOOST_OS_WINDOWS
+			char buf[MAX_PATH];
+			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+			else exe_dir = std::filesystem::current_path();
+#else
+			char buf[4096];
+			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+			if (len > 0) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+			else exe_dir = std::filesystem::current_path();
+#endif
+		}
+		catch (...) { exe_dir = std::filesystem::current_path(); }
+
+		std::filesystem::path cand1 = exe_dir / "bpy" / "blender_assets.py";
+		std::filesystem::path cand2 = std::filesystem::current_path() / "bpy" / "blender_assets.py";
+		if (std::filesystem::exists(cand1)) script_path = cand1;
+		else if (std::filesystem::exists(cand2)) script_path = cand2;
+		else {
+			std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
+			curl_global_cleanup();
+			return 1;
+		}
+
+		// build command
+		// 支持在 --assets 参数中指定特殊选项 --target-blender <path> 来指定要调用的 Blender 可执行文件
+		std::string blender_exe = "blender";
+		std::vector<std::string> pass_args;
+		for (size_t i = 0; i < vals.size(); ++i) {
+			const auto& tok = vals[i];
+			if ((tok == "--target-blender" || tok == "--blender-exe") && (i + 1) < vals.size()) {
+				blender_exe = vals[i + 1];
+				++i; // skip next token
+			}
+			else {
+				pass_args.push_back(tok);
+			}
+		}
+
+		// quote blender executable if necessary
+		std::string cmd;
+		if (blender_exe.find(' ') != std::string::npos) cmd = "\"" + blender_exe + "\"";
+		else cmd = blender_exe;
+		cmd += " --background --python \"" + script_path.string() + "\" --";
+
+		for (const auto& s : pass_args) {
+			// quote each argument
+			std::string q = s;
+			if (q.find(' ') != std::string::npos) cmd += " \"" + q + "\"";
+			else cmd += " " + q;
+		}
+
+		std::cout << "Invoking: " << cmd << "\n";
+		int rc = std::system(cmd.c_str());
+		if (rc != 0) {
+			std::cerr << "Failed to run blender for asset management (rc=" << rc << ")\n";
+			curl_global_cleanup();
+			return 1;
+		}
+
+		curl_global_cleanup();
+		return 0;
+	}
+
 	// 非交互式模式：支持下载和查询
 	// --download=<file|url>: 下载指定文件（可为文件名或完整 URL）
 	if (vm.count("download")) {
+		// discover available versions lazily (only when download is requested)
+		VersionDiscovery vd;
+		auto available_versions = vd.discover("https://download.blender.org/release/", 5000);
+
 		std::string arg = vm["download"].as<std::string>();
 		if (arg.empty()) {
 			std::cerr << "--download requires a value, e.g. --download=blender-3.6.1-windows-x64.zip or --download=https://...\n";
@@ -824,12 +670,95 @@ int main(int argc, char** argv)
 					curl_global_cleanup();
 					return 1;
 				}
+
 				if (candidates.size() > 1) {
-					std::cout << "Multiple matches found for '" << arg << "':\n";
-					for (const auto& c : candidates) std::cout << "  " << c.first << "/" << c.second << "\n";
-					curl_global_cleanup();
-					return 1;
+					// Multiple matching files: perform parallel downloads according to config
+					unsigned int parallel = cfg.parallel;
+					if (parallel == 0) {
+						parallel = std::thread::hardware_concurrency();
+						if (parallel == 0) parallel = 2;
+					}
+
+					std::cout << "Multiple matches found for '" << arg << "' - downloading " << candidates.size() << " files using " << parallel << " threads\n";
+
+					// determine exe directory (runtime directory) and ensure download directory exists under it
+					std::filesystem::path exe_dir_local;
+					try {
+#if BOOST_OS_WINDOWS
+						char buf[MAX_PATH];
+						DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+						if (len > 0 && len < MAX_PATH) exe_dir_local = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+						else exe_dir_local = std::filesystem::current_path();
+#else
+						char buf[4096];
+						ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+						if (len > 0) { exe_dir_local = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
+						else exe_dir_local = std::filesystem::current_path();
+#endif
+					}
+					catch (...) { exe_dir_local = std::filesystem::current_path(); }
+
+					std::filesystem::path outdir_local = exe_dir_local / std::filesystem::path("versions");
+					try { std::filesystem::create_directories(outdir_local); }
+					catch (...) {}
+
+					// prepare list of urls and filenames
+					std::vector<std::pair<std::string, std::string>> tasks;
+					for (const auto& c : candidates) {
+						std::string ver = c.first;
+						std::string fn = c.second;
+						std::string u = std::string("https://download.blender.org/release/") + ver + "/" + fn;
+						tasks.emplace_back(u, fn);
+					}
+
+					std::atomic_size_t index{ 0 };
+					std::vector<std::thread> workers;
+					std::vector<bool> results(tasks.size(), false);
+					std::mutex io_mtx;
+
+					auto worker = [&](unsigned int /*id*/) {
+						for (;;) {
+							size_t i = index.fetch_add(1);
+							if (i >= tasks.size()) break;
+							const auto& t = tasks[i];
+							std::filesystem::path outpath = outdir_local / t.second;
+
+							{
+								std::lock_guard<std::mutex> lk(io_mtx);
+								std::cout << "[thread] Downloading: " << t.first << " -> " << outpath.string() << "\n";
+							}
+
+							bool ok = download_file(t.first, outpath, 0);
+
+							{
+								std::lock_guard<std::mutex> lk(io_mtx);
+								if (ok) std::cout << "[thread] Downloaded: " << outpath.string() << "\n";
+								else std::cerr << "[thread] Failed: " << t.first << "\n";
+							}
+							results[i] = ok;
+						}
+						};
+
+					// launch workers
+					unsigned int workers_to_launch = std::min<unsigned int>(parallel, static_cast<unsigned int>(tasks.size()));
+					for (unsigned int w = 0; w < workers_to_launch; ++w) workers.emplace_back(worker, w);
+					for (auto& th : workers) if (th.joinable()) th.join();
+
+					bool any_failed = false;
+					for (size_t i = 0; i < results.size(); ++i) if (!results[i]) any_failed = true;
+
+					if (any_failed) {
+						std::cerr << "One or more downloads failed\n";
+						curl_global_cleanup();
+						return 1;
+					}
+					else {
+						std::cout << "All downloads completed successfully\n";
+						curl_global_cleanup();
+						return 0;
+					}
 				}
+
 				found_version = candidates[0].first;
 				found_file = candidates[0].second;
 			}
@@ -855,7 +784,7 @@ int main(int argc, char** argv)
 		}
 		catch (...) { exe_dir = std::filesystem::current_path(); }
 
-		std::filesystem::path outdir = exe_dir / cfg.download_dir;
+		std::filesystem::path outdir = exe_dir / std::filesystem::path("versions");
 		try { std::filesystem::create_directories(outdir); }
 		catch (...) {}
 		std::filesystem::path outpath = outdir / filename;
@@ -879,10 +808,6 @@ int main(int argc, char** argv)
 				vs << parts[0];
 				for (size_t i = 1; i < parts.size(); ++i) vs << "." << parts[i];
 				verstr = vs.str();
-			}
-			if (verstr.empty()) {
-				// fallback: try to find 'Blender' prefix + numbers in filename
-				verstr = "";
 			}
 
 			// determine exe directory (runtime directory)
@@ -1003,7 +928,7 @@ int main(int argc, char** argv)
 		}
 		catch (...) { exe_dir = std::filesystem::current_path(); }
 
-		std::filesystem::path versions_dir = exe_dir / cfg.download_dir;
+		std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
 		if (!std::filesystem::exists(versions_dir)) {
 			std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
 			curl_global_cleanup();
@@ -1074,6 +999,14 @@ int main(int argc, char** argv)
 
 	// --show-all-ver: 列出所有大版本
 	if (vm.count("show-all-ver")) {
+		std::string html;
+		if (!download_html("https://download.blender.org/release/", html, 8000)) {
+			std::cerr << "获取主索引失败\n";
+			curl_global_cleanup();
+			return 1;
+		}
+		VersionParser vp_for_major;
+		std::vector<std::string> majors = vp_for_major.parseMajorVersions(html);
 		std::cout << "Major versions:\n";
 		for (const auto& m : majors) std::cout << "  " << m << "\n";
 		curl_global_cleanup();
@@ -1097,11 +1030,9 @@ int main(int argc, char** argv)
 			curl_global_cleanup();
 			return 1;
 		}
-		GumboOutput* sub = gumbo_parse(sub_html.c_str());
-		std::set<std::string> files_set;
-		parse_download_links(sub->root, files_set);
-		gumbo_destroy_output(&kGumboDefaultOptions, sub);
-		auto files = filter_by_system(files_set);
+		VersionParser vp_local;
+		std::set<std::string> files_set = vp_local.parseDownloadLinks(sub_html);
+		auto files = vp_local.filterBySystem(files_set);
 		if (files.empty()) {
 			std::cout << "No compatible files found for " << target << "\n";
 			curl_global_cleanup();
