@@ -88,6 +88,12 @@ def modify_asset_lib(identifier: str, new_name=None, new_path=None) -> None:
 
 
 def main() -> None:
+    class SilentOutput:
+        def write(self, s): pass
+        def flush(self): pass
+
+    sys.stdout = SilentOutput()
+    sys.stderr = SilentOutput()
     args = parse_args()
     if not args:
         print("用法:")

@@ -47,6 +47,12 @@
     <None Include="bpy\blender_assets.py">
       <Filter>bpy</Filter>
     </None>
+    <None Include="..\vcpkg.json">
+      <Filter>资源文件</Filter>
+    </None>
+    <None Include="..\vcpkg-configuration.json">
+      <Filter>资源文件</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Blender-Dock\version_parser.h">

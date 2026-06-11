@@ -1,4 +1,4 @@
-﻿#ifdef _MSC_VER
+#ifdef _MSC_VER
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include <iostream>
@@ -7,7 +7,6 @@
 #include <set>
 #include <map>
 #include <curl/curl.h>
-#include <gumbo.h>
 #include "Blender-Dock/version_parser.h"
 #include "Blender-Dock/version_discovery.h"
 #include "Blender-Dock/network_client.h"
@@ -16,6 +15,8 @@
 #include <fstream>
 #include <filesystem>
 #include <atomic>
+#include <cstdlib>
+#include <clocale>
 #include <boost/program_options.hpp>
 #if defined(__x86_64__) || defined(_M_X64) || defined(_M_IX86) || defined(__i386__)
 #include <cpu_features/cpuinfo_x86.h>
@@ -34,9 +35,10 @@
 #include <boost/predef/os.h>
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <zip.h>
 #include <nlohmann/json.hpp>
+
+namespace po = boost::program_options;
 
 // 前向声明：下面会使用 parse_version_numbers
 static std::vector<int> parse_version_numbers(const std::string& s);
@@ -156,6 +158,27 @@ static void ensure_workspace_structure()
 		std::filesystem::create_directories("logs");
 	}
 	catch (...) {}
+}
+
+// 返回可执行文件所在目录（平台特定实现）
+static std::filesystem::path get_executable_dir()
+{
+	try {
+#if BOOST_OS_WINDOWS
+		char buf[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+		if (len > 0 && len < MAX_PATH) return std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+		return std::filesystem::current_path();
+#else
+		char buf[4096];
+		ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (len > 0) return std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+		return std::filesystem::current_path();
+#endif
+	}
+	catch (...) {
+		return std::filesystem::current_path();
+	}
 }
 
 // 尝试将 .zip 文件解压缩到目标目录成功时返回 true
@@ -349,6 +372,607 @@ static void print_sys_info()
 	std::cout << "========================================\n\n";
 }
 
+#if BOOST_OS_WINDOWS
+static std::string build_windows_command_line(const std::vector<std::string>& args) {
+	std::string cmdline;
+	for (size_t i = 0; i < args.size(); ++i) {
+		if (i > 0) cmdline += ' ';
+		const std::string& arg = args[i];
+		// 需要转义的情况：参数包含空格、制表符或双引号
+		bool need_quote = (arg.find_first_of(" \t\"") != std::string::npos);
+		if (!need_quote) {
+			cmdline += arg;
+		}
+		else {
+			cmdline += '"';
+			for (char c : arg) {
+				if (c == '"') {
+					cmdline += "\\\"";   // 内部双引号转义
+				}
+				else {
+					cmdline += c;
+				}
+			}
+			cmdline += '"';
+		}
+	}
+	return cmdline;
+}
+#endif
+
+static void handle_config(const po::variables_map& vm, SimpleConfig& cfg) {
+	auto& vals = vm["config"].as<std::vector<std::string>>();
+	if (vals.empty()) {
+		std::cerr << "--config requires arguments, e.g. --config download parallel_downloads=4\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+	std::string section = vals[0];
+	if (section == "download") {
+		int new_parallel = -1;
+		for (size_t i = 1; i < vals.size(); ++i) {
+			const std::string& tok = vals[i];
+			const std::string key = "parallel_downloads=";
+			if (tok.rfind(key, 0) == 0) {
+				std::string num = tok.substr(key.size());
+				try { new_parallel = std::stoi(num); }
+				catch (...) { new_parallel = -1; }
+			}
+		}
+		if (new_parallel < 0) {
+			std::cerr << "Invalid or missing parallel_downloads value. Usage: --config download parallel_downloads=4\n";
+			curl_global_cleanup();
+			exit(1);
+		}
+
+		// read config file
+		std::filesystem::path cfgpath = std::filesystem::path("config") / "config.json";
+		std::string s = read_file_all(cfgpath);
+		if (s.empty()) {
+			// create default then read again
+			write_default_config(cfgpath);
+			s = read_file_all(cfgpath);
+		}
+		if (s.empty()) s = "{}";
+
+		// locate existing key
+		std::string keyname = "\"parallel_downloads\"";
+		size_t pos = s.find(keyname);
+		if (pos != std::string::npos) {
+			size_t colon = s.find(':', pos);
+			if (colon != std::string::npos) {
+				size_t valstart = colon + 1;
+				// skip spaces
+				while (valstart < s.size() && isspace(static_cast<unsigned char>(s[valstart]))) ++valstart;
+				size_t valend = valstart;
+				while (valend < s.size() && (std::isdigit(static_cast<unsigned char>(s[valend])) || s[valend] == '-')) ++valend;
+				s.replace(valstart, valend - valstart, std::to_string(new_parallel));
+			}
+		}
+		else {
+			// insert before final }
+			size_t brace = s.rfind('}');
+			std::string insert = "  \"parallel_downloads\": " + std::to_string(new_parallel) + "\n";
+			if (brace != std::string::npos) {
+				// ensure proper comma handling: if preceding non-space before brace is not '{', add comma
+				size_t prev = brace;
+				while (prev > 0 && isspace(static_cast<unsigned char>(s[prev - 1]))) --prev;
+				if (prev > 0 && s[prev - 1] != '{' && s[prev - 1] != ',') insert = ",\n" + insert;
+				s.insert(brace, insert);
+			}
+			else {
+				s = "{\n" + insert + "}\n";
+			}
+		}
+
+		// write back
+		try {
+			std::filesystem::create_directories(cfgpath.parent_path());
+			std::ofstream ofs(cfgpath, std::ios::trunc);
+			if (!ofs) {
+				std::cerr << "Failed to open config file for writing: " << cfgpath.string() << "\n";
+				curl_global_cleanup();
+				exit(1);
+			}
+			ofs << s;
+			ofs.close();
+			std::cout << "Updated config: " << cfgpath.string() << " (parallel_downloads=" << new_parallel << ")\n";
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "Failed to write config: " << ex.what() << "\n";
+			curl_global_cleanup();
+			exit(1);
+		}
+
+		// reload cfg
+		cfg = load_config_json(cfgpath.string());
+		curl_global_cleanup();
+		return;
+	}
+
+	else {
+		std::cerr << "Unknown config section: " << section << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+}
+
+static void handle_list_installed(const po::variables_map& vm) {
+	// determine exe_dir and versions dir
+	std::filesystem::path exe_dir = get_executable_dir();
+
+	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
+	if (!std::filesystem::exists(versions_dir)) {
+		std::cout << "Versions directory not found: " << versions_dir.string() << "\n";
+		curl_global_cleanup();
+		return;
+	}
+
+	std::cout << "Installed Blender versions under: " << versions_dir.string() << "\n";
+	for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
+		if (!e.is_directory()) continue;
+		std::string name = e.path().filename().string();
+		std::filesystem::path inst = e.path();
+		// locate blender executable
+		std::filesystem::path exe_path;
+#if BOOST_OS_WINDOWS
+		std::vector<std::string> look = { "blender.exe", "bin\\blender.exe" };
+		for (auto& s : look) {
+			std::filesystem::path p = inst / s;
+			if (std::filesystem::exists(p)) { exe_path = p; break; }
+		}
+#else
+		std::vector<std::string> look = { "blender", "./blender", "bin/blender" };
+		for (auto& s : look) {
+			std::filesystem::path p = inst / s;
+			if (std::filesystem::exists(p)) { exe_path = p; break; }
+		}
+#endif
+		std::cout << " - " << name << " -> " << inst.string();
+		if (!exe_path.empty()) std::cout << " (executable: " << exe_path.string() << ")";
+		else std::cout << " (no executable found)";
+		std::cout << "\n";
+	}
+
+	curl_global_cleanup();
+	return;
+}
+
+static void handle_assets(const po::variables_map& vm) {
+	auto& vals = vm["assets"].as<std::vector<std::string>>();
+	if (vals.empty()) {
+		std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
+		curl_global_cleanup();
+		exit(1);;
+	}
+
+	// locate script: try executable dir and current working dir
+	std::filesystem::path script_path;
+	std::filesystem::path exe_dir = get_executable_dir();
+
+	std::filesystem::path cand1 = exe_dir / "bpy" / "blender_assets.py";
+	std::filesystem::path cand2 = std::filesystem::current_path() / "bpy" / "blender_assets.py";
+	if (std::filesystem::exists(cand1)) script_path = cand1;
+	else if (std::filesystem::exists(cand2)) script_path = cand2;
+	else {
+		std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
+		curl_global_cleanup();
+		exit(1);;
+	}
+
+	// build command
+	// 支持在 --assets 参数中指定特殊选项 --target-blender <path> 来指定要调用的 Blender 可执行文件
+	std::string blender_exe = "blender";
+	std::vector<std::string> pass_args;
+	for (size_t i = 0; i < vals.size(); ++i) {
+		const auto& tok = vals[i];
+		if ((tok == "--target-blender" || tok == "--blender-exe") && (i + 1) < vals.size()) {
+			blender_exe = vals[i + 1];
+			++i; // skip next token
+		}
+		else {
+			pass_args.push_back(tok);
+		}
+	}
+
+	// quote blender executable if necessary
+	std::string cmd;
+	if (blender_exe.find(' ') != std::string::npos) cmd = "\"" + blender_exe + "\"";
+	else cmd = blender_exe;
+	cmd += " --background --python \"" + script_path.string() + "\" --";
+
+	for (const auto& s : pass_args) {
+		// quote each argument
+		std::string q = s;
+		if (q.find(' ') != std::string::npos) cmd += " \"" + q + "\"";
+		else cmd += " " + q;
+	}
+
+	std::cout << "Invoking: " << cmd << "\n";
+	int rc = std::system(cmd.c_str());
+	if (rc != 0) {
+		std::cerr << "Failed to run blender for asset management (rc=" << rc << ")\n";
+		curl_global_cleanup();
+		exit(1);;
+	}
+
+	curl_global_cleanup();
+	return;
+}
+
+static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
+	// discover available versions lazily (only when download is requested)
+	VersionDiscovery vd;
+	auto available_versions = vd.discover("https://download.blender.org/release/", 5000);
+
+	std::string arg = vm["download"].as<std::string>();
+	if (arg.empty()) {
+		std::cerr << "--download requires a value, e.g. --download=blender-3.6.1-windows-x64.zip or --download=https://...\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	std::string url;
+	std::string filename;
+
+	// If arg looks like a URL, use it directly
+	if (arg.rfind("http://", 0) == 0 || arg.rfind("https://", 0) == 0) {
+		url = arg;
+		size_t pos = arg.find_last_of("/\\");
+		filename = (pos == std::string::npos) ? arg : arg.substr(pos + 1);
+	}
+	else {
+		// Search available_versions for exact match first
+		std::string found_file;
+		std::string found_version;
+		for (const auto& kv : available_versions) {
+			for (const auto& f : kv.second) {
+				if (f == arg) { found_file = f; found_version = kv.first; break; }
+			}
+			if (!found_file.empty()) break;
+		}
+		// If not exact, try substring match
+		if (found_file.empty()) {
+			std::vector<std::pair<std::string, std::string>> candidates;
+			for (const auto& kv : available_versions) {
+				for (const auto& f : kv.second) {
+					if (f.find(arg) != std::string::npos) candidates.emplace_back(kv.first, f);
+				}
+			}
+			if (candidates.empty()) {
+				std::cerr << "File not found in available versions: " << arg << "\n";
+				curl_global_cleanup();
+				exit(1);
+			}
+
+			if (candidates.size() > 1) {
+				// Multiple matching files: perform parallel downloads according to config
+				unsigned int parallel = cfg.parallel;
+				if (parallel == 0) {
+					parallel = std::thread::hardware_concurrency();
+					if (parallel == 0) parallel = 2;
+				}
+
+				std::cout << "Multiple matches found for '" << arg << "' - downloading " << candidates.size() << " files using " << parallel << " threads\n";
+
+				// determine exe directory (runtime directory) and ensure download directory exists under it
+				std::filesystem::path exe_dir_local = get_executable_dir();
+
+				std::filesystem::path outdir_local = exe_dir_local / std::filesystem::path("versions");
+				try { std::filesystem::create_directories(outdir_local); }
+				catch (...) {}
+
+				// prepare list of urls and filenames
+				std::vector<std::pair<std::string, std::string>> tasks;
+				for (const auto& c : candidates) {
+					std::string ver = c.first;
+					std::string fn = c.second;
+					std::string u = std::string("https://download.blender.org/release/") + ver + "/" + fn;
+					tasks.emplace_back(u, fn);
+				}
+
+				std::atomic_size_t index{ 0 };
+				std::vector<std::thread> workers;
+				std::vector<bool> results(tasks.size(), false);
+				std::mutex io_mtx;
+
+				auto worker = [&](unsigned int /*id*/) {
+					for (;;) {
+						size_t i = index.fetch_add(1);
+						if (i >= tasks.size()) break;
+						const auto& t = tasks[i];
+						std::filesystem::path outpath = outdir_local / t.second;
+
+						{
+							std::lock_guard<std::mutex> lk(io_mtx);
+							std::cout << "[thread] Downloading: " << t.first << " -> " << outpath.string() << "\n";
+						}
+
+						bool ok = download_file(t.first, outpath, 0);
+
+						{
+							std::lock_guard<std::mutex> lk(io_mtx);
+							if (ok) std::cout << "[thread] Downloaded: " << outpath.string() << "\n";
+							else std::cerr << "[thread] Failed: " << t.first << "\n";
+						}
+						results[i] = ok;
+					}
+					};
+
+				// launch workers
+				unsigned int workers_to_launch = std::min<unsigned int>(parallel, static_cast<unsigned int>(tasks.size()));
+				for (unsigned int w = 0; w < workers_to_launch; ++w) workers.emplace_back(worker, w);
+				for (auto& th : workers) if (th.joinable()) th.join();
+
+				bool any_failed = false;
+				for (size_t i = 0; i < results.size(); ++i) if (!results[i]) any_failed = true;
+
+				if (any_failed) {
+					std::cerr << "One or more downloads failed\n";
+					curl_global_cleanup();
+					exit(1);
+				}
+				else {
+					std::cout << "All downloads completed successfully\n";
+					curl_global_cleanup();
+					return;
+				}
+			}
+
+			found_version = candidates[0].first;
+			found_file = candidates[0].second;
+		}
+
+		url = std::string("https://download.blender.org/release/") + found_version + "/" + found_file;
+		filename = found_file;
+	}
+
+	// determine exe directory (runtime directory) and ensure download directory exists under it
+	std::filesystem::path exe_dir = get_executable_dir();
+
+	std::filesystem::path outdir = exe_dir / std::filesystem::path("versions");
+	try { std::filesystem::create_directories(outdir); }
+	catch (...) {}
+	std::filesystem::path outpath = outdir / filename;
+
+	std::cout << "Downloading: " << url << " -> " << outpath.string() << "\n";
+	bool ok = download_file(url, outpath, 0);
+	if (!ok) {
+		std::cerr << "Download failed for: " << url << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+	std::cout << "Downloaded to: " << outpath.string() << "\n";
+
+	// If zip, extract and move to executable directory with name BlenderX.X.X
+	if (outpath.extension() == ".zip") {
+		// derive version string from filename
+		std::string verstr;
+		auto parts = parse_version_numbers(filename);
+		if (!parts.empty()) {
+			std::ostringstream vs;
+			vs << parts[0];
+			for (size_t i = 1; i < parts.size(); ++i) vs << "." << parts[i];
+			verstr = vs.str();
+		}
+
+		// determine exe directory (runtime directory)
+		std::filesystem::path exe_dir = get_executable_dir();
+
+		// allow overriding target folder name via --name option (Boost.Program_options)
+		std::string target_name;
+		if (vm.count("name")) target_name = vm["name"].as<std::string>();
+		if (target_name.empty()) {
+			target_name = std::string("Blender") + (verstr.empty() ? filename.substr(0, filename.find('.')) : verstr);
+		}
+		std::filesystem::path target_path = outdir / target_name;
+
+		// temp extraction dir in download dir (under exe_dir/versions)
+		std::filesystem::path tmpdir = outdir / (filename + std::string(".tmp_extract"));
+		try { std::filesystem::remove_all(tmpdir); }
+		catch (...) {}
+
+		std::cout << "Extracting to temporary folder...\n";
+		bool extracted = extract_zip(outpath, tmpdir);
+		if (!extracted) {
+			std::cerr << "Extraction failed for: " << outpath.string() << "\n";
+			curl_global_cleanup();
+			exit(1);
+		}
+
+		// Inspect tmpdir children
+		std::vector<std::filesystem::path> children;
+		for (auto& e : std::filesystem::directory_iterator(tmpdir)) children.push_back(e.path());
+
+		try {
+			// remove existing target if present
+			if (std::filesystem::exists(target_path)) {
+				std::cout << "Removing existing target: " << target_path.string() << "\n";
+				std::filesystem::remove_all(target_path);
+			}
+
+			if (children.size() == 1 && std::filesystem::is_directory(children[0])) {
+				// rename single top-level directory to target name
+				std::filesystem::rename(children[0], target_path);
+			}
+			else {
+				// create target and move all children into it
+				std::filesystem::create_directories(target_path);
+				for (auto& p : children) {
+					std::filesystem::path dest = target_path / p.filename();
+					// try rename, fallback to copy
+					try { std::filesystem::rename(p, dest); }
+					catch (...) {
+						std::filesystem::copy(p, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
+						std::filesystem::remove_all(p);
+					}
+				}
+			}
+		}
+		catch (const std::exception& ex) {
+			std::cerr << "Failed to move extracted files: " << ex.what() << "\n";
+			// cleanup tmpdir
+			try { std::filesystem::remove_all(tmpdir); }
+			catch (...) {}
+			curl_global_cleanup();
+			exit(1);
+		}
+
+		// cleanup tmpdir
+		try { std::filesystem::remove_all(tmpdir); }
+		catch (...) {}
+
+		// remove archive after successful extraction
+		try { std::filesystem::remove(outpath); std::cout << "Removed archive: " << outpath.string() << "\n"; }
+		catch (...) {}
+
+		std::cout << "Extracted and moved to: " << target_path.string() << "\n";
+	}
+
+	curl_global_cleanup();
+	return;
+}
+
+static void handle_start(const po::variables_map& vm) {
+	std::string arg = vm["start"].as<std::string>();
+	if (arg.empty()) {
+		std::cerr << "--start requires a value (folder name under versions), e.g. --start=Blender3.6.23 or partial match\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	// determine exe_dir and versions dir
+	std::filesystem::path exe_dir;
+	try {
+#if BOOST_OS_WINDOWS
+		char buf[MAX_PATH];
+		DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
+		if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
+		else exe_dir = std::filesystem::current_path();
+#else
+		char buf[4096];
+		ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+		if (len > 0) { exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
+		else exe_dir = std::filesystem::current_path();
+#endif
+	}
+	catch (...) { exe_dir = std::filesystem::current_path(); }
+
+	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
+	if (!std::filesystem::exists(versions_dir)) {
+		std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	// find candidate folders
+	std::vector<std::filesystem::path> candidates;
+	for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
+		if (!e.is_directory()) continue;
+		std::string name = e.path().filename().string();
+		if (name == arg || name.find(arg) != std::string::npos) candidates.push_back(e.path());
+	}
+
+	if (candidates.empty()) {
+		std::cerr << "No matching Blender installation found for: " << arg << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	// launch each candidate
+	for (auto& inst : candidates) {
+		std::filesystem::path exe_path;
+#if BOOST_OS_WINDOWS
+		std::vector<std::string> look = { "blender.exe", "bin\\blender.exe" };
+		for (auto& s : look) {
+			std::filesystem::path p = inst / s;
+			if (std::filesystem::exists(p)) { exe_path = p; break; }
+		}
+		if (exe_path.empty()) { std::cerr << "blender.exe not found in: " << inst.string() << "\n"; continue; }
+
+		STARTUPINFOA si{}; PROCESS_INFORMATION pi{};
+		si.cb = sizeof(si);
+		std::string cmd = "\"" + exe_path.string() + "\"";
+		if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, FALSE, CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE, NULL, inst.string().c_str(), &si, &pi)) {
+			std::cerr << "Failed to start: " << exe_path.string() << " (err=" << GetLastError() << ")\n";
+		}
+		else {
+			CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+			std::cout << "Started: " << exe_path.string() << "\n";
+		}
+#else
+		std::vector<std::string> look = { "blender", "./blender", "bin/blender" };
+		for (auto& s : look) {
+			std::filesystem::path p = inst / s;
+			if (std::filesystem::exists(p)) { exe_path = p; break; }
+		}
+		if (exe_path.empty()) { std::cerr << "blender not found in: " << inst.string() << "\n"; continue; }
+
+		pid_t pid = fork();
+		if (pid == 0) {
+			exe_path = std::filesystem::absolute(exe_path);
+			execl(exe_path.string().c_str(), exe_path.string().c_str(), (char*)NULL);
+			_exit(1);
+		}
+		else if (pid > 0) {
+			std::cout << "Started: " << exe_path.string() << " (pid=" << pid << ")\n";
+		}
+		else {
+			std::cerr << "fork failed\n";
+		}
+#endif
+	}
+
+	curl_global_cleanup();
+	return;
+}
+
+static void handle_show_all_ver() {
+	std::string html;
+	if (!download_html("https://download.blender.org/release/", html, 8000)) {
+		std::cerr << "获取主索引失败\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+	VersionParser vp_for_major;
+	std::vector<std::string> majors = vp_for_major.parseMajorVersions(html);
+	std::cout << "Major versions:\n";
+	for (const auto& m : majors) std::cout << "  " << m << "\n";
+	curl_global_cleanup();
+	return;
+}
+
+static void handle_show_small_ver(const po::variables_map& vm) {
+	std::string arg = vm["show-small-ver"].as<std::string>();
+	if (arg.empty()) {
+		std::cerr << "--show-small-ver requires a value, e.g. --show-small-ver=3.6 or --show-small-ver=Blender3.6\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+	std::string target = arg;
+	if (!(target.size() > 0 && (target[0] == 'B' || target[0] == 'b'))) target = std::string("Blender") + target;
+	std::string url = std::string("https://download.blender.org/release/") + target + "/";
+	std::string sub_html;
+	if (!download_html(url, sub_html, 5000)) {
+		std::cerr << "Failed to fetch: " << url << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+	VersionParser vp_local;
+	std::set<std::string> files_set = vp_local.parseDownloadLinks(sub_html);
+	auto files = vp_local.filterBySystem(files_set);
+	if (files.empty()) {
+		std::cout << "No compatible files found for " << target << "\n";
+		curl_global_cleanup();
+		return;
+	}
+	std::sort(files.begin(), files.end(), filename_version_less);
+	std::cout << "Files for " << target << ":\n";
+	for (const auto& f : files) std::cout << "  " << f << "\n";
+	curl_global_cleanup();
+	return;
+}
+
 /// <summary>
 /// 主函数
 /// </summary>
@@ -356,18 +980,17 @@ static void print_sys_info()
 int main(int argc, char** argv)
 {
 	// parse command-line options using Boost.Program_options
-	namespace po = boost::program_options;
-	po::options_description desc("Allowed options");
+	po::options_description desc("全部选项");
 	desc.add_options()
-		("help,h", "show help")
-		("assets", po::value<std::vector<std::string>>()->multitoken(), "manage Blender asset libraries: add/remove/modify/list (passed to bpy/blender_assets.py)")
-		("config", po::value<std::vector<std::string>>()->multitoken(), "configure settings: e.g. --config download parallel_downloads=4")
-		("show-all-ver", "list major versions")
-		("show-small-ver", po::value<std::string>(), "list files for a major version (e.g. 3.6 or Blender3.6)")
-		("download", po::value<std::string>(), "download file name or URL")
-		("name", po::value<std::string>(), "custom name for extracted folder")
-		("start", po::value<std::string>(), "start Blender installation (folder name or partial)")
-		("list-installed", "list installed Blender versions under the local versions directory");
+		("help,h", "显示帮助")
+		("assets", po::value<std::vector<std::string>>()->multitoken(), "管理 Blender 资产库：添加/移除/修改/列出 (传递给 bpy/blender_assets.py)")
+		("config", po::value<std::vector<std::string>>()->multitoken(), "配置设置：例如 --config download parallel_downloads=4")
+		("show-all-ver", "列出主版本号")
+		("show-small-ver", po::value<std::string>(), "列出某个主版本的文件 (例如 3.6 或 Blender3.6)")
+		("download", po::value<std::string>(), "下载文件名或 URL")
+		("name", po::value<std::string>(), "解压文件夹的自定义名称")
+		("start", po::value<std::string>(), "启动 Blender 安装 (文件夹名称或部分匹配)")
+		("list-installed", "列出本地版本目录下已安装的 Blender 版本");
 	po::variables_map vm;
 	try {
 		po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -389,664 +1012,43 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
+	std::atexit([] { curl_global_cleanup(); });
+
 	// Ensure workspace and load config
 	ensure_workspace_structure();
 	SimpleConfig cfg = load_config_json();
 
 	// --config: configuration modifications (e.g. --config download parallel_downloads=4)
-	if (vm.count("config")) {
-		auto& vals = vm["config"].as<std::vector<std::string>>();
-		if (vals.empty()) {
-			std::cerr << "--config requires arguments, e.g. --config download parallel_downloads=4\n";
-			curl_global_cleanup();
-			return 1;
-		}
-		std::string section = vals[0];
-		if (section == "download") {
-			int new_parallel = -1;
-			for (size_t i = 1; i < vals.size(); ++i) {
-				const std::string& tok = vals[i];
-				const std::string key = "parallel_downloads=";
-				if (tok.rfind(key, 0) == 0) {
-					std::string num = tok.substr(key.size());
-					try { new_parallel = std::stoi(num); }
-					catch (...) { new_parallel = -1; }
-				}
-			}
-			if (new_parallel < 0) {
-				std::cerr << "Invalid or missing parallel_downloads value. Usage: --config download parallel_downloads=4\n";
-				curl_global_cleanup();
-				return 1;
-			}
-
-			// read config file
-			std::filesystem::path cfgpath = std::filesystem::path("config") / "config.json";
-			std::string s = read_file_all(cfgpath);
-			if (s.empty()) {
-				// create default then read again
-				write_default_config(cfgpath);
-				s = read_file_all(cfgpath);
-			}
-			if (s.empty()) s = "{}";
-
-			// locate existing key
-			std::string keyname = "\"parallel_downloads\"";
-			size_t pos = s.find(keyname);
-			if (pos != std::string::npos) {
-				size_t colon = s.find(':', pos);
-				if (colon != std::string::npos) {
-					size_t valstart = colon + 1;
-					// skip spaces
-					while (valstart < s.size() && isspace(static_cast<unsigned char>(s[valstart]))) ++valstart;
-					size_t valend = valstart;
-					while (valend < s.size() && (std::isdigit(static_cast<unsigned char>(s[valend])) || s[valend] == '-')) ++valend;
-					s.replace(valstart, valend - valstart, std::to_string(new_parallel));
-				}
-			}
-			else {
-				// insert before final }
-				size_t brace = s.rfind('}');
-				std::string insert = "  \"parallel_downloads\": " + std::to_string(new_parallel) + "\n";
-				if (brace != std::string::npos) {
-					// ensure proper comma handling: if preceding non-space before brace is not '{', add comma
-					size_t prev = brace;
-					while (prev > 0 && isspace(static_cast<unsigned char>(s[prev - 1]))) --prev;
-					if (prev > 0 && s[prev - 1] != '{' && s[prev - 1] != ',') insert = ",\n" + insert;
-					s.insert(brace, insert);
-				}
-				else {
-					s = "{\n" + insert + "}\n";
-				}
-			}
-
-			// write back
-			try {
-				std::filesystem::create_directories(cfgpath.parent_path());
-				std::ofstream ofs(cfgpath, std::ios::trunc);
-				if (!ofs) {
-					std::cerr << "Failed to open config file for writing: " << cfgpath.string() << "\n";
-					curl_global_cleanup();
-					return 1;
-				}
-				ofs << s;
-				ofs.close();
-				std::cout << "Updated config: " << cfgpath.string() << " (parallel_downloads=" << new_parallel << ")\n";
-			}
-			catch (const std::exception& ex) {
-				std::cerr << "Failed to write config: " << ex.what() << "\n";
-				curl_global_cleanup();
-				return 1;
-			}
-
-			// reload cfg
-			cfg = load_config_json(cfgpath.string());
-			curl_global_cleanup();
-			return 0;
-		}
-
-		else {
-			std::cerr << "Unknown config section: " << section << "\n";
-			curl_global_cleanup();
-			return 1;
-		}
-	}
+	if (vm.count("config")) handle_config(vm, cfg);
 
 	// --list-installed: 列出本地 versions 目录下已安装的 Blender
-	if (vm.count("list-installed")) {
-		// determine exe_dir and versions dir
-		std::filesystem::path exe_dir;
-		try {
-#if BOOST_OS_WINDOWS
-			char buf[MAX_PATH];
-			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#else
-			char buf[4096];
-			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-			if (len > 0) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#endif
-		}
-		catch (...) { exe_dir = std::filesystem::current_path(); }
-
-		std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
-		if (!std::filesystem::exists(versions_dir)) {
-			std::cout << "Versions directory not found: " << versions_dir.string() << "\n";
-			curl_global_cleanup();
-			return 0;
-		}
-
-		std::cout << "Installed Blender versions under: " << versions_dir.string() << "\n";
-		for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
-			if (!e.is_directory()) continue;
-			std::string name = e.path().filename().string();
-			std::filesystem::path inst = e.path();
-			// locate blender executable
-			std::filesystem::path exe_path;
-#if BOOST_OS_WINDOWS
-			std::vector<std::string> look = { "blender.exe", "bin\\blender.exe" };
-			for (auto& s : look) {
-				std::filesystem::path p = inst / s;
-				if (std::filesystem::exists(p)) { exe_path = p; break; }
-			}
-#else
-			std::vector<std::string> look = { "blender", "./blender", "bin/blender" };
-			for (auto& s : look) {
-				std::filesystem::path p = inst / s;
-				if (std::filesystem::exists(p)) { exe_path = p; break; }
-			}
-#endif
-			std::cout << " - " << name << " -> " << inst.string();
-			if (!exe_path.empty()) std::cout << " (executable: " << exe_path.string() << ")";
-			else std::cout << " (no executable found)";
-			std::cout << "\n";
-		}
-
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("list-installed")) handle_list_installed(vm);
 
 	// --assets: manage Blender asset libraries by invoking the bundled bpy/blender_assets.py
-	if (vm.count("assets")) {
-		auto& vals = vm["assets"].as<std::vector<std::string>>();
-		if (vals.empty()) {
-			std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		// locate script: try executable dir and current working dir
-		std::filesystem::path script_path;
-		std::filesystem::path exe_dir;
-		try {
-#if BOOST_OS_WINDOWS
-			char buf[MAX_PATH];
-			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#else
-			char buf[4096];
-			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-			if (len > 0) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#endif
-		}
-		catch (...) { exe_dir = std::filesystem::current_path(); }
-
-		std::filesystem::path cand1 = exe_dir / "bpy" / "blender_assets.py";
-		std::filesystem::path cand2 = std::filesystem::current_path() / "bpy" / "blender_assets.py";
-		if (std::filesystem::exists(cand1)) script_path = cand1;
-		else if (std::filesystem::exists(cand2)) script_path = cand2;
-		else {
-			std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		// build command
-		// 支持在 --assets 参数中指定特殊选项 --target-blender <path> 来指定要调用的 Blender 可执行文件
-		std::string blender_exe = "blender";
-		std::vector<std::string> pass_args;
-		for (size_t i = 0; i < vals.size(); ++i) {
-			const auto& tok = vals[i];
-			if ((tok == "--target-blender" || tok == "--blender-exe") && (i + 1) < vals.size()) {
-				blender_exe = vals[i + 1];
-				++i; // skip next token
-			}
-			else {
-				pass_args.push_back(tok);
-			}
-		}
-
-		// quote blender executable if necessary
-		std::string cmd;
-		if (blender_exe.find(' ') != std::string::npos) cmd = "\"" + blender_exe + "\"";
-		else cmd = blender_exe;
-		cmd += " --background --python \"" + script_path.string() + "\" --";
-
-		for (const auto& s : pass_args) {
-			// quote each argument
-			std::string q = s;
-			if (q.find(' ') != std::string::npos) cmd += " \"" + q + "\"";
-			else cmd += " " + q;
-		}
-
-		std::cout << "Invoking: " << cmd << "\n";
-		int rc = std::system(cmd.c_str());
-		if (rc != 0) {
-			std::cerr << "Failed to run blender for asset management (rc=" << rc << ")\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("assets")) handle_assets(vm);
 
 	// 非交互式模式：支持下载和查询
 	// --download=<file|url>: 下载指定文件（可为文件名或完整 URL）
-	if (vm.count("download")) {
-		// discover available versions lazily (only when download is requested)
-		VersionDiscovery vd;
-		auto available_versions = vd.discover("https://download.blender.org/release/", 5000);
-
-		std::string arg = vm["download"].as<std::string>();
-		if (arg.empty()) {
-			std::cerr << "--download requires a value, e.g. --download=blender-3.6.1-windows-x64.zip or --download=https://...\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		std::string url;
-		std::string filename;
-
-		// If arg looks like a URL, use it directly
-		if (arg.rfind("http://", 0) == 0 || arg.rfind("https://", 0) == 0) {
-			url = arg;
-			size_t pos = arg.find_last_of("/\\");
-			filename = (pos == std::string::npos) ? arg : arg.substr(pos + 1);
-		}
-		else {
-			// Search available_versions for exact match first
-			std::string found_file;
-			std::string found_version;
-			for (const auto& kv : available_versions) {
-				for (const auto& f : kv.second) {
-					if (f == arg) { found_file = f; found_version = kv.first; break; }
-				}
-				if (!found_file.empty()) break;
-			}
-			// If not exact, try substring match
-			if (found_file.empty()) {
-				std::vector<std::pair<std::string, std::string>> candidates;
-				for (const auto& kv : available_versions) {
-					for (const auto& f : kv.second) {
-						if (f.find(arg) != std::string::npos) candidates.emplace_back(kv.first, f);
-					}
-				}
-				if (candidates.empty()) {
-					std::cerr << "File not found in available versions: " << arg << "\n";
-					curl_global_cleanup();
-					return 1;
-				}
-
-				if (candidates.size() > 1) {
-					// Multiple matching files: perform parallel downloads according to config
-					unsigned int parallel = cfg.parallel;
-					if (parallel == 0) {
-						parallel = std::thread::hardware_concurrency();
-						if (parallel == 0) parallel = 2;
-					}
-
-					std::cout << "Multiple matches found for '" << arg << "' - downloading " << candidates.size() << " files using " << parallel << " threads\n";
-
-					// determine exe directory (runtime directory) and ensure download directory exists under it
-					std::filesystem::path exe_dir_local;
-					try {
-#if BOOST_OS_WINDOWS
-						char buf[MAX_PATH];
-						DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-						if (len > 0 && len < MAX_PATH) exe_dir_local = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-						else exe_dir_local = std::filesystem::current_path();
-#else
-						char buf[4096];
-						ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-						if (len > 0) { exe_dir_local = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
-						else exe_dir_local = std::filesystem::current_path();
-#endif
-					}
-					catch (...) { exe_dir_local = std::filesystem::current_path(); }
-
-					std::filesystem::path outdir_local = exe_dir_local / std::filesystem::path("versions");
-					try { std::filesystem::create_directories(outdir_local); }
-					catch (...) {}
-
-					// prepare list of urls and filenames
-					std::vector<std::pair<std::string, std::string>> tasks;
-					for (const auto& c : candidates) {
-						std::string ver = c.first;
-						std::string fn = c.second;
-						std::string u = std::string("https://download.blender.org/release/") + ver + "/" + fn;
-						tasks.emplace_back(u, fn);
-					}
-
-					std::atomic_size_t index{ 0 };
-					std::vector<std::thread> workers;
-					std::vector<bool> results(tasks.size(), false);
-					std::mutex io_mtx;
-
-					auto worker = [&](unsigned int /*id*/) {
-						for (;;) {
-							size_t i = index.fetch_add(1);
-							if (i >= tasks.size()) break;
-							const auto& t = tasks[i];
-							std::filesystem::path outpath = outdir_local / t.second;
-
-							{
-								std::lock_guard<std::mutex> lk(io_mtx);
-								std::cout << "[thread] Downloading: " << t.first << " -> " << outpath.string() << "\n";
-							}
-
-							bool ok = download_file(t.first, outpath, 0);
-
-							{
-								std::lock_guard<std::mutex> lk(io_mtx);
-								if (ok) std::cout << "[thread] Downloaded: " << outpath.string() << "\n";
-								else std::cerr << "[thread] Failed: " << t.first << "\n";
-							}
-							results[i] = ok;
-						}
-						};
-
-					// launch workers
-					unsigned int workers_to_launch = std::min<unsigned int>(parallel, static_cast<unsigned int>(tasks.size()));
-					for (unsigned int w = 0; w < workers_to_launch; ++w) workers.emplace_back(worker, w);
-					for (auto& th : workers) if (th.joinable()) th.join();
-
-					bool any_failed = false;
-					for (size_t i = 0; i < results.size(); ++i) if (!results[i]) any_failed = true;
-
-					if (any_failed) {
-						std::cerr << "One or more downloads failed\n";
-						curl_global_cleanup();
-						return 1;
-					}
-					else {
-						std::cout << "All downloads completed successfully\n";
-						curl_global_cleanup();
-						return 0;
-					}
-				}
-
-				found_version = candidates[0].first;
-				found_file = candidates[0].second;
-			}
-
-			url = std::string("https://download.blender.org/release/") + found_version + "/" + found_file;
-			filename = found_file;
-		}
-
-		// determine exe directory (runtime directory) and ensure download directory exists under it
-		std::filesystem::path exe_dir;
-		try {
-#if BOOST_OS_WINDOWS
-			char buf[MAX_PATH];
-			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#else
-			char buf[4096];
-			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-			if (len > 0) { exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
-			else exe_dir = std::filesystem::current_path();
-#endif
-		}
-		catch (...) { exe_dir = std::filesystem::current_path(); }
-
-		std::filesystem::path outdir = exe_dir / std::filesystem::path("versions");
-		try { std::filesystem::create_directories(outdir); }
-		catch (...) {}
-		std::filesystem::path outpath = outdir / filename;
-
-		std::cout << "Downloading: " << url << " -> " << outpath.string() << "\n";
-		bool ok = download_file(url, outpath, 0);
-		if (!ok) {
-			std::cerr << "Download failed for: " << url << "\n";
-			curl_global_cleanup();
-			return 1;
-		}
-		std::cout << "Downloaded to: " << outpath.string() << "\n";
-
-		// If zip, extract and move to executable directory with name BlenderX.X.X
-		if (outpath.extension() == ".zip") {
-			// derive version string from filename
-			std::string verstr;
-			auto parts = parse_version_numbers(filename);
-			if (!parts.empty()) {
-				std::ostringstream vs;
-				vs << parts[0];
-				for (size_t i = 1; i < parts.size(); ++i) vs << "." << parts[i];
-				verstr = vs.str();
-			}
-
-			// determine exe directory (runtime directory)
-			std::filesystem::path exe_dir;
-			try {
-#if BOOST_OS_WINDOWS
-				char buf[MAX_PATH];
-				DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-				if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-				else exe_dir = std::filesystem::current_path();
-#else
-				// try /proc/self/exe
-				char buf[4096];
-				ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-				if (len > 0) { exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
-				else exe_dir = std::filesystem::current_path();
-#endif
-			}
-			catch (...) { exe_dir = std::filesystem::current_path(); }
-
-			// allow overriding target folder name via --name option (Boost.Program_options)
-			std::string target_name;
-			if (vm.count("name")) target_name = vm["name"].as<std::string>();
-			if (target_name.empty()) {
-				target_name = std::string("Blender") + (verstr.empty() ? filename.substr(0, filename.find('.')) : verstr);
-			}
-			std::filesystem::path target_path = outdir / target_name;
-
-			// temp extraction dir in download dir (under exe_dir/versions)
-			std::filesystem::path tmpdir = outdir / (filename + std::string(".tmp_extract"));
-			try { std::filesystem::remove_all(tmpdir); }
-			catch (...) {}
-
-			std::cout << "Extracting to temporary folder...\n";
-			bool extracted = extract_zip(outpath, tmpdir);
-			if (!extracted) {
-				std::cerr << "Extraction failed for: " << outpath.string() << "\n";
-				curl_global_cleanup();
-				return 1;
-			}
-
-			// Inspect tmpdir children
-			std::vector<std::filesystem::path> children;
-			for (auto& e : std::filesystem::directory_iterator(tmpdir)) children.push_back(e.path());
-
-			try {
-				// remove existing target if present
-				if (std::filesystem::exists(target_path)) {
-					std::cout << "Removing existing target: " << target_path.string() << "\n";
-					std::filesystem::remove_all(target_path);
-				}
-
-				if (children.size() == 1 && std::filesystem::is_directory(children[0])) {
-					// rename single top-level directory to target name
-					std::filesystem::rename(children[0], target_path);
-				}
-				else {
-					// create target and move all children into it
-					std::filesystem::create_directories(target_path);
-					for (auto& p : children) {
-						std::filesystem::path dest = target_path / p.filename();
-						// try rename, fallback to copy
-						try { std::filesystem::rename(p, dest); }
-						catch (...) {
-							std::filesystem::copy(p, dest, std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-							std::filesystem::remove_all(p);
-						}
-					}
-				}
-			}
-			catch (const std::exception& ex) {
-				std::cerr << "Failed to move extracted files: " << ex.what() << "\n";
-				// cleanup tmpdir
-				try { std::filesystem::remove_all(tmpdir); }
-				catch (...) {}
-				curl_global_cleanup();
-				return 1;
-			}
-
-			// cleanup tmpdir
-			try { std::filesystem::remove_all(tmpdir); }
-			catch (...) {}
-
-			// remove archive after successful extraction
-			try { std::filesystem::remove(outpath); std::cout << "Removed archive: " << outpath.string() << "\n"; }
-			catch (...) {}
-
-			std::cout << "Extracted and moved to: " << target_path.string() << "\n";
-		}
-
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("download")) handle_download(vm, cfg);
 
 	// --start=<BlenderName>: 启动指定已解压的 Blender 目录（文件夹名或部分匹配），支持同版本多实例
-	if (vm.count("start")) {
-		std::string arg = vm["start"].as<std::string>();
-		if (arg.empty()) {
-			std::cerr << "--start requires a value (folder name under versions), e.g. --start=Blender3.6.23 or partial match\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		// determine exe_dir and versions dir
-		std::filesystem::path exe_dir;
-		try {
-#if BOOST_OS_WINDOWS
-			char buf[MAX_PATH];
-			DWORD len = GetModuleFileNameA(NULL, buf, MAX_PATH);
-			if (len > 0 && len < MAX_PATH) exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path();
-			else exe_dir = std::filesystem::current_path();
-#else
-			char buf[4096];
-			ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-			if (len > 0) { exe_dir = std::filesystem::path(std::string(buf, static_cast<size_t>(len))).parent_path(); }
-			else exe_dir = std::filesystem::current_path();
-#endif
-		}
-		catch (...) { exe_dir = std::filesystem::current_path(); }
-
-		std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
-		if (!std::filesystem::exists(versions_dir)) {
-			std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		// find candidate folders
-		std::vector<std::filesystem::path> candidates;
-		for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
-			if (!e.is_directory()) continue;
-			std::string name = e.path().filename().string();
-			if (name == arg || name.find(arg) != std::string::npos) candidates.push_back(e.path());
-		}
-
-		if (candidates.empty()) {
-			std::cerr << "No matching Blender installation found for: " << arg << "\n";
-			curl_global_cleanup();
-			return 1;
-		}
-
-		// launch each candidate
-		for (auto& inst : candidates) {
-			std::filesystem::path exe_path;
-#if BOOST_OS_WINDOWS
-			std::vector<std::string> look = { "blender.exe", "bin\\blender.exe" };
-			for (auto& s : look) {
-				std::filesystem::path p = inst / s;
-				if (std::filesystem::exists(p)) { exe_path = p; break; }
-			}
-			if (exe_path.empty()) { std::cerr << "blender.exe not found in: " << inst.string() << "\n"; continue; }
-
-			STARTUPINFOA si{}; PROCESS_INFORMATION pi{};
-			si.cb = sizeof(si);
-			std::string cmd = "\"" + exe_path.string() + "\"";
-			if (!CreateProcessA(NULL, cmd.data(), NULL, NULL, FALSE, CREATE_NEW_PROCESS_GROUP | CREATE_NEW_CONSOLE, NULL, inst.string().c_str(), &si, &pi)) {
-				std::cerr << "Failed to start: " << exe_path.string() << " (err=" << GetLastError() << ")\n";
-			}
-			else {
-				CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-				std::cout << "Started: " << exe_path.string() << "\n";
-			}
-#else
-			std::vector<std::string> look = { "blender", "./blender", "bin/blender" };
-			for (auto& s : look) {
-				std::filesystem::path p = inst / s;
-				if (std::filesystem::exists(p)) { exe_path = p; break; }
-			}
-			if (exe_path.empty()) { std::cerr << "blender not found in: " << inst.string() << "\n"; continue; }
-
-			pid_t pid = fork();
-			if (pid == 0) {
-				exe_path = std::filesystem::absolute(exe_path);
-				execl(exe_path.string().c_str(), exe_path.string().c_str(), (char*)NULL);
-				_exit(1);
-			}
-			else if (pid > 0) {
-				std::cout << "Started: " << exe_path.string() << " (pid=" << pid << ")\n";
-			}
-			else {
-				std::cerr << "fork failed\n";
-			}
-#endif
-		}
-
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("start")) handle_start(vm);
 
 	// --show-all-ver: 列出所有大版本
-	if (vm.count("show-all-ver")) {
-		std::string html;
-		if (!download_html("https://download.blender.org/release/", html, 8000)) {
-			std::cerr << "获取主索引失败\n";
-			curl_global_cleanup();
-			return 1;
-		}
-		VersionParser vp_for_major;
-		std::vector<std::string> majors = vp_for_major.parseMajorVersions(html);
-		std::cout << "Major versions:\n";
-		for (const auto& m : majors) std::cout << "  " << m << "\n";
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("show-all-ver")) handle_show_all_ver();
 
 	// --show-small-ver=<Major>: 列出指定大版本下可用的小版本（过滤当前系统）
-	if (vm.count("show-small-ver")) {
-		std::string arg = vm["show-small-ver"].as<std::string>();
-		if (arg.empty()) {
-			std::cerr << "--show-small-ver requires a value, e.g. --show-small-ver=3.6 or --show-small-ver=Blender3.6\n";
-			curl_global_cleanup();
-			return 1;
-		}
-		std::string target = arg;
-		if (!(target.size() > 0 && (target[0] == 'B' || target[0] == 'b'))) target = std::string("Blender") + target;
-		std::string url = std::string("https://download.blender.org/release/") + target + "/";
-		std::string sub_html;
-		if (!download_html(url, sub_html, 5000)) {
-			std::cerr << "Failed to fetch: " << url << "\n";
-			curl_global_cleanup();
-			return 1;
-		}
-		VersionParser vp_local;
-		std::set<std::string> files_set = vp_local.parseDownloadLinks(sub_html);
-		auto files = vp_local.filterBySystem(files_set);
-		if (files.empty()) {
-			std::cout << "No compatible files found for " << target << "\n";
-			curl_global_cleanup();
-			return 0;
-		}
-		std::sort(files.begin(), files.end(), filename_version_less);
-		std::cout << "Files for " << target << ":\n";
-		for (const auto& f : files) std::cout << "  " << f << "\n";
-		curl_global_cleanup();
-		return 0;
-	}
+	if (vm.count("show-small-ver")) handle_show_small_ver(vm);
 
 	// 未提供已知非交互选项，打印由 Boost.Program_options 生成的用法提示
-	std::cout << desc << "\n";
-	curl_global_cleanup();
+	if (!(vm.count("config") ||
+		vm.count("list-installed") ||
+		vm.count("assets") ||
+		vm.count("download") ||
+		vm.count("start") ||
+		vm.count("show-all-ver") ||
+		vm.count("show-small-ver"))) {
+		std::cout << desc << "\n";
+	}
 	return 0;
 }
