@@ -543,13 +543,12 @@ static void handle_assets(const po::variables_map& vm) {
 	if (vals.empty()) {
 		std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
 		curl_global_cleanup();
-		exit(1);;
+		exit(1);
 	}
 
-	// locate script: try executable dir and current working dir
+	// 定位脚本路径
 	std::filesystem::path script_path;
 	std::filesystem::path exe_dir = get_executable_dir();
-
 	std::filesystem::path cand1 = exe_dir / "bpy" / "blender_assets.py";
 	std::filesystem::path cand2 = std::filesystem::current_path() / "bpy" / "blender_assets.py";
 	if (std::filesystem::exists(cand1)) script_path = cand1;
@@ -557,43 +556,163 @@ static void handle_assets(const po::variables_map& vm) {
 	else {
 		std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
 		curl_global_cleanup();
-		exit(1);;
+		exit(1);
 	}
 
-	// build command
-	// 支持在 --assets 参数中指定特殊选项 --target-blender <path> 来指定要调用的 Blender 可执行文件
-	std::string blender_exe = "blender";
+	// 解析参数，提取 blender 可执行文件和传递给脚本的参数
+	std::string blender_exe = "blender";   // 默认从 PATH 查找
 	std::vector<std::string> pass_args;
 	for (size_t i = 0; i < vals.size(); ++i) {
 		const auto& tok = vals[i];
 		if ((tok == "--target-blender" || tok == "--blender-exe") && (i + 1) < vals.size()) {
 			blender_exe = vals[i + 1];
-			++i; // skip next token
+			++i; // 跳过下一个 token
 		}
 		else {
 			pass_args.push_back(tok);
 		}
 	}
 
-	// quote blender executable if necessary
-	std::string cmd;
-	if (blender_exe.find(' ') != std::string::npos) cmd = "\"" + blender_exe + "\"";
-	else cmd = blender_exe;
-	cmd += " --background --python \"" + script_path.string() + "\" --";
-
-	for (const auto& s : pass_args) {
-		// quote each argument
-		std::string q = s;
-		if (q.find(' ') != std::string::npos) cmd += " \"" + q + "\"";
-		else cmd += " " + q;
+	// 构建参数字符串列表（不含 shell）
+	std::vector<std::string> args;
+	args.push_back(blender_exe);
+	args.push_back("--background");
+	// 不再传递 --quiet，而是通过重定向消除 Blender 自身输出
+	args.push_back("--python");
+	args.push_back(script_path.string());
+	args.push_back("--");
+	for (const auto& a : pass_args) {
+		args.push_back(a);
 	}
 
-	std::cout << "Invoking: " << cmd << "\n";
-	int rc = std::system(cmd.c_str());
-	if (rc != 0) {
-		std::cerr << "Failed to run blender for asset management (rc=" << rc << ")\n";
+	// ---------- 平台相关进程创建与同步等待 ----------
+	int exit_code = 1;
+	// 约定 Python 脚本将结果写入此文件
+	const std::string result_file = "assets_result.txt";
+
+#if BOOST_OS_WINDOWS
+	// Windows：使用 CreateProcess，重定向子进程标准输出和标准错误到 NUL
+	std::string cmdline = build_windows_command_line(args);
+	std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
+	cmdline_buf.push_back('\0');
+
+	// 创建 NUL 句柄（类似 /dev/null）
+	SECURITY_ATTRIBUTES sa;
+	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa.bInheritHandle = TRUE;      // 子进程可以继承该句柄
+	sa.lpSecurityDescriptor = NULL;
+
+	HANDLE hNull = CreateFileA("NUL", GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
+	if (hNull == INVALID_HANDLE_VALUE) {
+		std::cerr << "Failed to open NUL device\n";
 		curl_global_cleanup();
-		exit(1);;
+		exit(1);
+	}
+
+	STARTUPINFOA si{};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdOutput = hNull;
+	si.hStdError = hNull;
+	// 保留标准输入为默认（或也可以指向 NUL，但 Blender 不需要输入）
+	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+	PROCESS_INFORMATION pi{};
+
+	BOOL success = CreateProcessA(
+		nullptr,                // 应用程序名（NULL 表示从命令行解析第一个标记）
+		cmdline_buf.data(),     // 命令行
+		nullptr,                // 进程安全属性
+		nullptr,                // 线程安全属性
+		TRUE,                   // 必须为 TRUE 以继承句柄（传递 hNull 等）
+		0,                      // 创建标志
+		nullptr,                // 环境块（使用调用进程的环境）
+		nullptr,                // 当前目录（使用调用进程的当前目录）
+		&si,
+		&pi
+	);
+
+	// 关闭我们打开的 NUL 句柄，子进程已继承了一份副本
+	CloseHandle(hNull);
+
+	if (!success) {
+		std::cerr << "Failed to create process: " << blender_exe << " (error " << GetLastError() << ")\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	// 等待进程结束
+	WaitForSingleObject(pi.hProcess, INFINITE);
+	DWORD exit_code_win = 1;
+	GetExitCodeProcess(pi.hProcess, &exit_code_win);
+	exit_code = static_cast<int>(exit_code_win);
+
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+
+#else
+	// POSIX (Linux / macOS)：使用 fork + execvp，重定向到 /dev/null
+	pid_t pid = fork();
+	if (pid == 0) {
+		// 子进程：重定向 stdout 和 stderr 到 /dev/null
+		int null_fd = open("/dev/null", O_WRONLY);
+		if (null_fd >= 0) {
+			dup2(null_fd, STDOUT_FILENO);
+			dup2(null_fd, STDERR_FILENO);
+			close(null_fd);
+		}
+		// 构建 char* 数组
+		std::vector<char*> argv;
+		for (auto& a : args) {
+			argv.push_back(const_cast<char*>(a.c_str()));
+		}
+		argv.push_back(nullptr);
+
+		execvp(argv[0], argv.data());   // 自动搜索 PATH
+		// 如果 execvp 返回，说明出错
+		std::cerr << "execvp failed: " << strerror(errno) << std::endl;
+		_exit(1);
+	}
+	else if (pid > 0) {
+		// 父进程：等待子进程结束
+		int status = 0;
+		waitpid(pid, &status, 0);
+		if (WIFEXITED(status)) {
+			exit_code = WEXITSTATUS(status);
+		}
+		else {
+			std::cerr << "Blender process terminated abnormally\n";
+			exit_code = 1;
+		}
+	}
+	else {
+		std::cerr << "fork failed\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+#endif
+
+	// 检查子进程是否成功
+	if (exit_code != 0) {
+		std::cerr << "Blender asset management script exited with code " << exit_code << "\n";
+		curl_global_cleanup();
+		exit(1);
+	}
+
+	// 读取 Python 脚本生成的结果文件并输出到控制台
+	std::ifstream ifs(result_file);
+	if (ifs) {
+		std::string line;
+		while (std::getline(ifs, line)) {
+			std::cout << line << '\n';
+		}
+		ifs.close();
+		// 清理临时文件
+		std::filesystem::remove(result_file);
+	}
+	else {
+		// 如果文件不存在，可能是因为脚本没有输出（例如操作成功但无额外信息），这是正常的
+		// 也可以选择输出一个默认消息，这里保持静默
 	}
 
 	curl_global_cleanup();
