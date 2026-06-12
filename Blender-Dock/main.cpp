@@ -40,23 +40,8 @@
 
 namespace po = boost::program_options;
 
-// 前向声明：下面会使用 parse_version_numbers
-static std::vector<int> parse_version_numbers(const std::string& s);
-
-// 按嵌入的版本号比较文件名 (例如 "blender-4.2.10-...")
-static bool filename_version_less(const std::string& a, const std::string& b)
-{
-	auto va = parse_version_numbers(a);
-	auto vb = parse_version_numbers(b);
-	size_t n = (va.size() > vb.size()) ? va.size() : vb.size();
-	for (size_t i = 0; i < n; ++i) {
-		int ai = i < va.size() ? va[i] : 0;
-		int bi = i < vb.size() ? vb[i] : 0;
-		if (ai < bi) return true;
-		if (ai > bi) return false;
-	}
-	return a < b;
-}
+// Wrapper that calls the real libcurl cleanup. We will register this with atexit.
+static void curl_global_cleanup_impl() { curl_global_cleanup(); }
 
 // 从字符串中解析版本号，例如 "Blender3.6.1" / "3.6.1" -> {3,6,1}
 static std::vector<int> parse_version_numbers(const std::string& s)
@@ -80,6 +65,21 @@ static std::vector<int> parse_version_numbers(const std::string& s)
 	}
 	if (!cur.empty()) parts.push_back(std::stoi(cur));
 	return parts;
+}
+
+// 按嵌入的版本号比较文件名 (例如 "blender-4.2.10-...")
+static bool filename_version_less(const std::string& a, const std::string& b)
+{
+	auto va = parse_version_numbers(a);
+	auto vb = parse_version_numbers(b);
+	size_t n = (va.size() > vb.size()) ? va.size() : vb.size();
+	for (size_t i = 0; i < n; ++i) {
+		int ai = i < va.size() ? va[i] : 0;
+		int bi = i < vb.size() ? vb[i] : 0;
+		if (ai < bi) return true;
+		if (ai > bi) return false;
+	}
+	return a < b;
 }
 
 // 从文件加载配置（简单密钥格式返回下载基目录
@@ -404,7 +404,6 @@ static void handle_config(const po::variables_map& vm, SimpleConfig& cfg) {
 	auto& vals = vm["config"].as<std::vector<std::string>>();
 	if (vals.empty()) {
 		std::cerr << "--config requires arguments, e.g. --config download parallel_downloads=4\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 	std::string section = vals[0];
@@ -421,9 +420,8 @@ static void handle_config(const po::variables_map& vm, SimpleConfig& cfg) {
 		}
 		if (new_parallel < 0) {
 			std::cerr << "Invalid or missing parallel_downloads value. Usage: --config download parallel_downloads=4\n";
-			curl_global_cleanup();
 			exit(1);
-		}
+		} 
 
 		// read config file
 		std::filesystem::path cfgpath = std::filesystem::path("config") / "config.json";
@@ -471,7 +469,6 @@ static void handle_config(const po::variables_map& vm, SimpleConfig& cfg) {
 			std::ofstream ofs(cfgpath, std::ios::trunc);
 			if (!ofs) {
 				std::cerr << "Failed to open config file for writing: " << cfgpath.string() << "\n";
-				curl_global_cleanup();
 				exit(1);
 			}
 			ofs << s;
@@ -480,19 +477,16 @@ static void handle_config(const po::variables_map& vm, SimpleConfig& cfg) {
 		}
 		catch (const std::exception& ex) {
 			std::cerr << "Failed to write config: " << ex.what() << "\n";
-			curl_global_cleanup();
 			exit(1);
 		}
 
 		// reload cfg
 		cfg = load_config_json(cfgpath.string());
-		curl_global_cleanup();
 		return;
 	}
 
 	else {
 		std::cerr << "Unknown config section: " << section << "\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 }
@@ -504,7 +498,6 @@ static void handle_list_installed(const po::variables_map& vm) {
 	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
 	if (!std::filesystem::exists(versions_dir)) {
 		std::cout << "Versions directory not found: " << versions_dir.string() << "\n";
-		curl_global_cleanup();
 		return;
 	}
 
@@ -527,14 +520,14 @@ static void handle_list_installed(const po::variables_map& vm) {
 			std::filesystem::path p = inst / s;
 			if (std::filesystem::exists(p)) { exe_path = p; break; }
 		}
-#endif
+	#endif
+
 		std::cout << " - " << name << " -> " << inst.string();
 		if (!exe_path.empty()) std::cout << " (executable: " << exe_path.string() << ")";
 		else std::cout << " (no executable found)";
 		std::cout << "\n";
 	}
 
-	curl_global_cleanup();
 	return;
 }
 
@@ -542,7 +535,6 @@ static void handle_assets(const po::variables_map& vm) {
 	auto& vals = vm["assets"].as<std::vector<std::string>>();
 	if (vals.empty()) {
 		std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -555,7 +547,6 @@ static void handle_assets(const po::variables_map& vm) {
 	else if (std::filesystem::exists(cand2)) script_path = cand2;
 	else {
 		std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -605,7 +596,6 @@ static void handle_assets(const po::variables_map& vm) {
 	HANDLE hNull = CreateFileA("NUL", GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
 	if (hNull == INVALID_HANDLE_VALUE) {
 		std::cerr << "Failed to open NUL device\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -637,7 +627,6 @@ static void handle_assets(const po::variables_map& vm) {
 
 	if (!success) {
 		std::cerr << "Failed to create process: " << blender_exe << " (error " << GetLastError() << ")\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -687,7 +676,6 @@ static void handle_assets(const po::variables_map& vm) {
 	}
 	else {
 		std::cerr << "fork failed\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 #endif
@@ -695,9 +683,8 @@ static void handle_assets(const po::variables_map& vm) {
 	// 检查子进程是否成功
 	if (exit_code != 0) {
 		std::cerr << "Blender asset management script exited with code " << exit_code << "\n";
-		curl_global_cleanup();
 		exit(1);
-	}
+	} 
 
 	// 读取 Python 脚本生成的结果文件并输出到控制台
 	std::ifstream ifs(result_file);
@@ -715,7 +702,6 @@ static void handle_assets(const po::variables_map& vm) {
 		// 也可以选择输出一个默认消息，这里保持静默
 	}
 
-	curl_global_cleanup();
 	return;
 }
 
@@ -727,7 +713,6 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 	std::string arg = vm["download"].as<std::string>();
 	if (arg.empty()) {
 		std::cerr << "--download requires a value, e.g. --download=blender-3.6.1-windows-x64.zip or --download=https://...\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -760,7 +745,6 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 			}
 			if (candidates.empty()) {
 				std::cerr << "File not found in available versions: " << arg << "\n";
-				curl_global_cleanup();
 				exit(1);
 			}
 
@@ -827,15 +811,13 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 				for (size_t i = 0; i < results.size(); ++i) if (!results[i]) any_failed = true;
 
 				if (any_failed) {
-					std::cerr << "One or more downloads failed\n";
-					curl_global_cleanup();
-					exit(1);
-				}
+								std::cerr << "One or more downloads failed\n";
+								exit(1);
+							}
 				else {
-					std::cout << "All downloads completed successfully\n";
-					curl_global_cleanup();
-					return;
-				}
+								std::cout << "All downloads completed successfully\n";
+								return;
+							}
 			}
 
 			found_version = candidates[0].first;
@@ -858,7 +840,6 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 	bool ok = download_file(url, outpath, 0);
 	if (!ok) {
 		std::cerr << "Download failed for: " << url << "\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 	std::cout << "Downloaded to: " << outpath.string() << "\n";
@@ -894,10 +875,9 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 		std::cout << "Extracting to temporary folder...\n";
 		bool extracted = extract_zip(outpath, tmpdir);
 		if (!extracted) {
-			std::cerr << "Extraction failed for: " << outpath.string() << "\n";
-			curl_global_cleanup();
-			exit(1);
-		}
+						std::cerr << "Extraction failed for: " << outpath.string() << "\n";
+						exit(1);
+					}
 
 		// Inspect tmpdir children
 		std::vector<std::filesystem::path> children;
@@ -929,13 +909,12 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 			}
 		}
 		catch (const std::exception& ex) {
-			std::cerr << "Failed to move extracted files: " << ex.what() << "\n";
-			// cleanup tmpdir
-			try { std::filesystem::remove_all(tmpdir); }
-			catch (...) {}
-			curl_global_cleanup();
-			exit(1);
-		}
+						std::cerr << "Failed to move extracted files: " << ex.what() << "\n";
+						// cleanup tmpdir
+						try { std::filesystem::remove_all(tmpdir); }
+						catch (...) {}
+						exit(1);
+					}
 
 		// cleanup tmpdir
 		try { std::filesystem::remove_all(tmpdir); }
@@ -948,7 +927,6 @@ static void handle_download(const po::variables_map& vm, SimpleConfig& cfg) {
 		std::cout << "Extracted and moved to: " << target_path.string() << "\n";
 	}
 
-	curl_global_cleanup();
 	return;
 }
 
@@ -956,7 +934,6 @@ static void handle_start(const po::variables_map& vm) {
 	std::string arg = vm["start"].as<std::string>();
 	if (arg.empty()) {
 		std::cerr << "--start requires a value (folder name under versions), e.g. --start=Blender3.6.23 or partial match\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -980,7 +957,6 @@ static void handle_start(const po::variables_map& vm) {
 	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
 	if (!std::filesystem::exists(versions_dir)) {
 		std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -994,7 +970,6 @@ static void handle_start(const po::variables_map& vm) {
 
 	if (candidates.empty()) {
 		std::cerr << "No matching Blender installation found for: " << arg << "\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 
@@ -1036,36 +1011,33 @@ static void handle_start(const po::variables_map& vm) {
 		else if (pid > 0) {
 			std::cout << "Started: " << exe_path.string() << " (pid=" << pid << ")\n";
 		}
-		else {
-			std::cerr << "fork failed\n";
+					else {
+						std::cerr << "fork failed\n";
+					}
+				#endif
+
+				}
+
+			return;
 		}
-#endif
-	}
 
-	curl_global_cleanup();
-	return;
-}
-
-static void handle_show_all_ver() {
+		static void handle_show_all_ver() {
 	std::string html;
 	if (!download_html("https://download.blender.org/release/", html, 8000)) {
 		std::cerr << "获取主索引失败\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 	VersionParser vp_for_major;
 	std::vector<std::string> majors = vp_for_major.parseMajorVersions(html);
 	std::cout << "Major versions:\n";
 	for (const auto& m : majors) std::cout << "  " << m << "\n";
-	curl_global_cleanup();
-	return;
+	return; 
 }
 
 static void handle_show_small_ver(const po::variables_map& vm) {
 	std::string arg = vm["show-small-ver"].as<std::string>();
 	if (arg.empty()) {
 		std::cerr << "--show-small-ver requires a value, e.g. --show-small-ver=3.6 or --show-small-ver=Blender3.6\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 	std::string target = arg;
@@ -1074,7 +1046,6 @@ static void handle_show_small_ver(const po::variables_map& vm) {
 	std::string sub_html;
 	if (!download_html(url, sub_html, 5000)) {
 		std::cerr << "Failed to fetch: " << url << "\n";
-		curl_global_cleanup();
 		exit(1);
 	}
 	VersionParser vp_local;
@@ -1082,13 +1053,11 @@ static void handle_show_small_ver(const po::variables_map& vm) {
 	auto files = vp_local.filterBySystem(files_set);
 	if (files.empty()) {
 		std::cout << "No compatible files found for " << target << "\n";
-		curl_global_cleanup();
 		return;
 	}
 	std::sort(files.begin(), files.end(), filename_version_less);
 	std::cout << "Files for " << target << ":\n";
 	for (const auto& f : files) std::cout << "  " << f << "\n";
-	curl_global_cleanup();
 	return;
 }
 
@@ -1131,7 +1100,7 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	std::atexit([] { curl_global_cleanup(); });
+	std::atexit(curl_global_cleanup_impl);
 
 	// Ensure workspace and load config
 	ensure_workspace_structure();
