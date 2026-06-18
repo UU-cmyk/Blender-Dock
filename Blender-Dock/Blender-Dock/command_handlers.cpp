@@ -105,6 +105,7 @@ void handle_list_installed(const po::variables_map& vm) {
 
 	return;
 }
+
 void handle_download(const po::variables_map& vm, Config& cfg) {
 	// 懒惰地发现可用版本 (仅当请求下载时)
 	VersionDiscovery vd;
@@ -395,6 +396,15 @@ void handle_delete(const po::variables_map& vm) {
 	}
 
 	return;
+}
+
+void handle_name(const po::variables_map& vm) {
+	std::string name = vm["name"].as<std::string>();
+	if (name.empty()) {
+		std::cerr << "--name requires a value, e.g. --name=MyBlender\n";
+		exit(1);
+	}
+	std::cout << "Name: " << name << "\n";
 }
 
 void handle_show_all_ver() {
