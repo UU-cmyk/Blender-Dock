@@ -13,9 +13,6 @@ void handle_config(const po::variables_map& vm, Config& cfg);
 // 列出本地版本目录下已安装的 Blender 版本
 void handle_list_installed(const po::variables_map& vm);
 
-// 管理 Blender 资产库：添加/移除/修改/列出
-void handle_assets(const po::variables_map& vm);
-
 // 下载指定文件（可为文件名或完整 URL）
 void handle_download(const po::variables_map& vm, Config& cfg);
 
@@ -27,3 +24,6 @@ void handle_show_all_ver();
 
 // 列出指定大版本下可用的小版本（过滤当前系统）
 void handle_show_small_ver(const po::variables_map& vm);
+
+// 删除已安装的 Blender 版本（文件夹名称或部分匹配）
+void handle_delete(const po::variables_map& vm);

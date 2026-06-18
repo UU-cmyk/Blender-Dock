@@ -11,23 +11,23 @@
 
 namespace po = boost::program_options;
 
-// Wrapper that calls the real libcurl cleanup. We will register this with atexit.
+// 调用真正的 libcurl 清理的包装器我们将使用 atexit 注册它
 static void curl_global_cleanup_impl() { curl_global_cleanup(); }
 
 int main(int argc, char** argv)
 {
-	// parse command-line options using Boost.Program_options
+	// 使用 Boost Program 解析命令选项
 	po::options_description desc("全部选项");
 	desc.add_options()
 		("help,h", "显示帮助")
-		("assets", po::value<std::vector<std::string>>()->multitoken(), "管理 Blender 资产库：添加/移除/修改/列出 (传递给 bpy/blender_assets.py)")
 		("config", po::value<std::vector<std::string>>()->multitoken(), "配置设置：例如 --config download parallel_downloads=4")
 		("show-all-ver", "列出主版本号")
 		("show-small-ver", po::value<std::string>(), "列出某个主版本的文件 (例如 3.6 或 Blender3.6)")
 		("download", po::value<std::string>(), "下载文件名或 URL")
 		("name", po::value<std::string>(), "解压文件夹的自定义名称")
 		("start", po::value<std::string>(), "启动 Blender 安装 (文件夹名称或部分匹配)")
-		("list-installed", "列出本地版本目录下已安装的 Blender 版本");
+		("list-installed", "列出本地版本目录下已安装的 Blender 版本")
+		("delete", po::value<std::string>(), "删除已安装的 Blender 版本 (文件夹名称或部分匹配) ");
 	po::variables_map vm;
 	try {
 		po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -51,18 +51,18 @@ int main(int argc, char** argv)
 
 	std::atexit(curl_global_cleanup_impl);
 
-	// Ensure workspace and load config
+	// 确保工作区和加载配置
 	ensure_workspace_structure();
 	Config cfg = ConfigManager::load();
 
-	// --config: configuration modifications
+	// --config: 配置修改
 	if (vm.count("config")) handle_config(vm, cfg);
 
-	// --list-installed: list locally installed Blender versions
+	// --list-installed: 列出安装的Blender版本
 	if (vm.count("list-installed")) handle_list_installed(vm);
 
-	// --assets: manage Blender asset libraries
-	if (vm.count("assets")) handle_assets(vm);
+	// --delete: 删除已安装的Blender版本
+	if (vm.count("delete")) handle_delete(vm);
 
 	// --download: download a file or URL
 	if (vm.count("download")) handle_download(vm, cfg);
@@ -79,7 +79,7 @@ int main(int argc, char** argv)
 	// If no recognized option was given, print usage
 	if (!(vm.count("config") ||
 		vm.count("list-installed") ||
-		vm.count("assets") ||
+		vm.count("delete") ||
 		vm.count("download") ||
 		vm.count("start") ||
 		vm.count("show-all-ver") ||

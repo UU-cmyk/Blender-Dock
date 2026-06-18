@@ -159,7 +159,6 @@
     <None Include="..\README.md" />
     <None Include="..\vcpkg-configuration.json" />
     <None Include="..\vcpkg.json" />
-    <None Include="bpy\blender_assets.py" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Blender-Dock\command_handlers.h" />

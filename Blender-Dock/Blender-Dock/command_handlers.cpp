@@ -105,169 +105,8 @@ void handle_list_installed(const po::variables_map& vm) {
 
 	return;
 }
-
-void handle_assets(const po::variables_map& vm) {
-	auto& vals = vm["assets"].as<std::vector<std::string>>();
-	if (vals.empty()) {
-		std::cerr << "--assets requires arguments, e.g. --assets add MyLib C:/path/to/lib or --assets list\n";
-		exit(1);
-	}
-
-	// 定位脚本路径
-	std::filesystem::path script_path;
-	std::filesystem::path exe_dir = get_executable_dir();
-	std::filesystem::path cand1 = exe_dir / "bpy" / "blender_assets.py";
-	std::filesystem::path cand2 = std::filesystem::current_path() / "bpy" / "blender_assets.py";
-	if (std::filesystem::exists(cand1)) script_path = cand1;
-	else if (std::filesystem::exists(cand2)) script_path = cand2;
-	else {
-		std::cerr << "Blender assets script not found (expected bpy/blender_assets.py in exe or cwd)\n";
-		exit(1);
-	}
-
-	// 解析参数，提取 blender 可执行文件和传递给脚本的参数
-	std::string blender_exe = "blender";   // 默认从 PATH 查找
-	std::vector<std::string> pass_args;
-	for (size_t i = 0; i < vals.size(); ++i) {
-		const auto& tok = vals[i];
-		if ((tok == "--target-blender" || tok == "--blender-exe") && (i + 1) < vals.size()) {
-			blender_exe = vals[i + 1];
-			++i; // 跳过下一个 token
-		}
-		else {
-			pass_args.push_back(tok);
-		}
-	}
-
-	// 构建参数字符串列表（不含 shell）
-	std::vector<std::string> args;
-	args.push_back(blender_exe);
-	args.push_back("--background");
-	args.push_back("--python");
-	args.push_back(script_path.string());
-	args.push_back("--");
-	for (const auto& a : pass_args) {
-		args.push_back(a);
-	}
-
-	// ---------- 平台相关进程创建与同步等待 ----------
-	int exit_code = 1;
-	// 约定 Python 脚本将结果写入此文件
-	const std::string result_file = "assets_result.txt";
-
-#if BOOST_OS_WINDOWS
-	// Windows：使用 CreateProcess，重定向子进程标准输出和标准错误到 NUL
-	std::string cmdline = build_windows_command_line(args);
-	std::vector<char> cmdline_buf(cmdline.begin(), cmdline.end());
-	cmdline_buf.push_back('\0');
-
-	// 创建 NUL 句柄（类似 /dev/null）
-	SECURITY_ATTRIBUTES sa;
-	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-	sa.bInheritHandle = TRUE;
-	sa.lpSecurityDescriptor = NULL;
-
-	HANDLE hNull = CreateFileA("NUL", GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
-	if (hNull == INVALID_HANDLE_VALUE) {
-		std::cerr << "Failed to open NUL device\n";
-		exit(1);
-	}
-
-	STARTUPINFOA si{};
-	si.cb = sizeof(si);
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdOutput = hNull;
-	si.hStdError = hNull;
-	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-
-	PROCESS_INFORMATION pi{};
-
-	BOOL success = CreateProcessA(
-		nullptr,
-		cmdline_buf.data(),
-		nullptr,
-		nullptr,
-		TRUE,
-		0,
-		nullptr,
-		nullptr,
-		&si,
-		&pi
-	);
-
-	CloseHandle(hNull);
-
-	if (!success) {
-		std::cerr << "Failed to create process: " << blender_exe << " (error " << GetLastError() << ")\n";
-		exit(1);
-	}
-
-	WaitForSingleObject(pi.hProcess, INFINITE);
-	DWORD exit_code_win = 1;
-	GetExitCodeProcess(pi.hProcess, &exit_code_win);
-	exit_code = static_cast<int>(exit_code_win);
-
-	CloseHandle(pi.hThread);
-	CloseHandle(pi.hProcess);
-
-#else
-	// POSIX (Linux / macOS)：使用 fork + execvp，重定向到 /dev/null
-	pid_t pid = fork();
-	if (pid == 0) {
-		int null_fd = open("/dev/null", O_WRONLY);
-		if (null_fd >= 0) {
-			dup2(null_fd, STDOUT_FILENO);
-			dup2(null_fd, STDERR_FILENO);
-			close(null_fd);
-		}
-		std::vector<char*> argv;
-		for (auto& a : args) {
-			argv.push_back(const_cast<char*>(a.c_str()));
-		}
-		argv.push_back(nullptr);
-
-		execvp(argv[0], argv.data());
-		std::cerr << "execvp failed: " << strerror(errno) << std::endl;
-		_exit(1);
-	}
-	else if (pid > 0) {
-		int status = 0;
-		waitpid(pid, &status, 0);
-		if (WIFEXITED(status)) {
-			exit_code = WEXITSTATUS(status);
-		}
-		else {
-			std::cerr << "Blender process terminated abnormally\n";
-			exit_code = 1;
-		}
-	}
-	else {
-		std::cerr << "fork failed\n";
-		exit(1);
-	}
-#endif
-
-	if (exit_code != 0) {
-		std::cerr << "Blender asset management script exited with code " << exit_code << "\n";
-		exit(1);
-	}
-
-	// 读取 Python 脚本生成的结果文件并输出到控制台
-	std::ifstream ifs(result_file);
-	if (ifs) {
-		std::string line;
-		while (std::getline(ifs, line)) {
-			std::cout << line << '\n';
-		}
-		ifs.close();
-		std::filesystem::remove(result_file);
-	}
-
-	return;
-}
-
 void handle_download(const po::variables_map& vm, Config& cfg) {
-	// discover available versions lazily (only when download is requested)
+	// 懒惰地发现可用版本 (仅当请求下载时)
 	VersionDiscovery vd;
 	auto available_versions = vd.discover("https://download.blender.org/release/", 5000);
 
@@ -500,6 +339,59 @@ void handle_start(const po::variables_map& vm) {
 			std::cerr << "fork failed\n";
 		}
 #endif
+	}
+
+	return;
+}
+
+void handle_delete(const po::variables_map& vm) {
+	std::string arg = vm["delete"].as<std::string>();
+	if (arg.empty()) {
+		std::cerr << "--delete requires a value (folder name under versions), e.g. --delete=Blender3.6.23 or partial match\n";
+		exit(1);
+	}
+
+	std::filesystem::path exe_dir = get_executable_dir();
+	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
+	if (!std::filesystem::exists(versions_dir)) {
+		std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
+		exit(1);
+	}
+
+	// find matching folders
+	std::vector<std::filesystem::path> to_delete;
+	for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
+		if (!e.is_directory()) continue;
+		std::string name = e.path().filename().string();
+		if (name == arg || name.find(arg) != std::string::npos) to_delete.push_back(e.path());
+	}
+
+	if (to_delete.empty()) {
+		std::cerr << "No matching Blender installation found for: " << arg << "\n";
+		exit(1);
+	}
+
+	// confirm and delete
+	std::cout << "The following Blender installations will be deleted:\n";
+	for (const auto& p : to_delete) {
+		std::cout << "  " << p.string() << "\n";
+	}
+	std::cout << "Are you sure? (y/N): ";
+	std::string confirm;
+	std::getline(std::cin, confirm);
+	if (confirm != "y" && confirm != "Y") {
+		std::cout << "Deletion cancelled.\n";
+		return;
+	}
+
+	for (const auto& p : to_delete) {
+		std::error_code ec;
+		std::filesystem::remove_all(p, ec);
+		if (ec) {
+			std::cerr << "Failed to delete: " << p.string() << " (" << ec.message() << ")\n";
+			exit(1);
+		}
+		std::cout << "Deleted: " << p.string() << "\n";
 	}
 
 	return;
