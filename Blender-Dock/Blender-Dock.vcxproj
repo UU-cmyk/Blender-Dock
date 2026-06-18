@@ -144,7 +144,10 @@
     </Manifest>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="Blender-Dock\command_handlers.cpp" />
+    <ClCompile Include="Blender-Dock\download_utils.cpp" />
     <ClCompile Include="Blender-Dock\network_client.cpp" />
+    <ClCompile Include="Blender-Dock\platform_utils.cpp" />
     <ClCompile Include="Blender-Dock\version_discovery.cpp" />
     <ClCompile Include="Blender-Dock\version_parser.cpp" />
     <ClCompile Include="config_manager.cpp" />
@@ -159,7 +162,10 @@
     <None Include="bpy\blender_assets.py" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Blender-Dock\command_handlers.h" />
+    <ClInclude Include="Blender-Dock\download_utils.h" />
     <ClInclude Include="Blender-Dock\network_client.h" />
+    <ClInclude Include="Blender-Dock\platform_utils.h" />
     <ClInclude Include="Blender-Dock\version_discovery.h" />
     <ClInclude Include="Blender-Dock\version_parser.h" />
     <ClInclude Include="config_manager.h" />

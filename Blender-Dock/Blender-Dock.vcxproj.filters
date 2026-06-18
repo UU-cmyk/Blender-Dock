@@ -36,6 +36,15 @@
     <ClCompile Include="main.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="Blender-Dock\platform_utils.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Blender-Dock\download_utils.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="Blender-Dock\command_handlers.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="..\.gitignore">
@@ -68,6 +77,15 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="zip_extractor.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Blender-Dock\platform_utils.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Blender-Dock\download_utils.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="Blender-Dock\command_handlers.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

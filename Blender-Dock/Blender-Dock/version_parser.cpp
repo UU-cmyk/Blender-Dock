@@ -12,8 +12,7 @@
 #include <sys/utsname.h>
 #endif
 
-// 前向声明：用于文件名比较时的版本号解析辅助函数
-static std::vector<int> parse_version_numbers(const std::string& s);
+#include <sstream>
 
 static void parse_major_versions_node(GumboNode* node, std::vector<std::string>& out)
 {
@@ -181,8 +180,7 @@ std::vector<std::string> VersionParser::filterBySystem(const std::set<std::strin
 	return available;
 }
 
-// copy of parse_version_numbers used elsewhere when sorting
-static std::vector<int> parse_version_numbers(const std::string& s)
+std::vector<int> parse_version_numbers(const std::string& s)
 {
 	std::vector<int> parts;
 	size_t pos = s.find_first_of("0123456789");
@@ -203,4 +201,18 @@ static std::vector<int> parse_version_numbers(const std::string& s)
 	}
 	if (!cur.empty()) parts.push_back(std::stoi(cur));
 	return parts;
+}
+
+bool filename_version_less(const std::string& a, const std::string& b)
+{
+	auto va = parse_version_numbers(a);
+	auto vb = parse_version_numbers(b);
+	size_t n = (va.size() > vb.size()) ? va.size() : vb.size();
+	for (size_t i = 0; i < n; ++i) {
+		int ai = i < va.size() ? va[i] : 0;
+		int bi = i < vb.size() ? vb[i] : 0;
+		if (ai < bi) return true;
+		if (ai > bi) return false;
+	}
+	return a < b;
 }
