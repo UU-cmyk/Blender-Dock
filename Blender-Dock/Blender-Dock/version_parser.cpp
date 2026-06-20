@@ -4,6 +4,7 @@
 #include <cctype>
 #include <string>
 #include <set>
+#include <sstream>
 #include <vector>
 #include <boost/predef/os.h>
 #if BOOST_OS_WINDOWS
@@ -11,8 +12,6 @@
 #else
 #include <sys/utsname.h>
 #endif
-
-#include <sstream>
 
 static void parse_major_versions_node(GumboNode* node, std::vector<std::string>& out)
 {
@@ -82,10 +81,10 @@ std::set<std::string> VersionParser::parseDownloadLinks(const std::string& html)
 
 static bool filename_matches_arch(const std::string& name_lower)
 {
-	// 此函数供 filterBySystem 使用
+	// 此函数供 filterBySystem() 使用
 	// 在文件名中检测架构相关提示
-	// 注意：filterBySystem 会决定实际架构，这里只是简单检查文件名
-	return true; // 占位；实际逻辑在 filterBySystem 中实现
+	// 注意：filterBySystem() 会决定实际架构，这里只是简单检查文件名
+	return true; // 占位；实际逻辑在 filterBySystem() 中实现
 }
 
 std::vector<std::string> VersionParser::filterBySystem(const std::set<std::string>& files) const
@@ -143,16 +142,11 @@ std::vector<std::string> VersionParser::filterBySystem(const std::set<std::strin
 		if (lower.find("osx") != std::string::npos) continue;
 #endif
 		{
-			std::string probe = lower;
-			size_t pos = 0;
-			while ((pos = probe.find("blender", pos)) != std::string::npos) {
-				probe.erase(pos, 7);
-			}
-			if (probe.find("rc") != std::string::npos || probe.find("preview") != std::string::npos || probe.find("alpha") != std::string::npos || probe.find("beta") != std::string::npos || probe.find("add-ons-legacy-bundle") != std::string::npos) continue;
+			if (lower.find("rc") != std::string::npos || lower.find("preview") != std::string::npos || lower.find("alpha") != std::string::npos || lower.find("beta") != std::string::npos || lower.find("add-ons-legacy-bundle") != std::string::npos) continue;
 			bool foundSuffix = false;
-			for (size_t i = 1; i < probe.size(); ++i) {
-				if (std::isdigit(static_cast<unsigned char>(probe[i - 1]))) {
-					char c = probe[i];
+			for (size_t i = 1; i < lower.size(); ++i) {
+				if (std::isdigit(static_cast<unsigned char>(lower[i - 1]))) {
+					char c = lower[i];
 					if (c == 'a' || c == 'b' || c == 'c') { foundSuffix = true; break; }
 				}
 			}
@@ -161,19 +155,13 @@ std::vector<std::string> VersionParser::filterBySystem(const std::set<std::strin
 		if (!filename_matches_arch2(lower)) continue;
 
 #if BOOST_OS_WINDOWS
-		if (f.ends_with(".zip")) {
-			available.push_back(f);
-		}
+		if (f.ends_with(".zip")) available.push_back(f);
 #endif
 #if BOOST_OS_LINUX
-		if (f.ends_with(".tar.xz") || f.ends_with(".zip")) {
-			available.push_back(f);
-		}
+		if (f.ends_with(".tar.xz") || f.ends_with(".zip")) available.push_back(f);
 #endif
 #if BOOST_OS_MACOS
-		if (f.ends_with(".dmg") || f.ends_with(".zip")) {
-			available.push_back(f);
-		}
+		if (f.ends_with(".dmg") || f.ends_with(".zip")) available.push_back(f);
 #endif
 	}
 
@@ -188,16 +176,12 @@ std::vector<int> parse_version_numbers(const std::string& s)
 	std::string sub = s.substr(pos);
 	std::string cur;
 	for (char c : sub) {
-		if (std::isdigit(static_cast<unsigned char>(c))) {
-			cur.push_back(c);
-		}
+		if (std::isdigit(static_cast<unsigned char>(c))) cur.push_back(c);
 		else if (c == '.') {
 			if (!cur.empty()) { parts.push_back(std::stoi(cur)); cur.clear(); }
 			else parts.push_back(0);
 		}
-		else {
-			break;
-		}
+		else break;
 	}
 	if (!cur.empty()) parts.push_back(std::stoi(cur));
 	return parts;
@@ -211,8 +195,8 @@ bool filename_version_less(const std::string& a, const std::string& b)
 	for (size_t i = 0; i < n; ++i) {
 		int ai = i < va.size() ? va[i] : 0;
 		int bi = i < vb.size() ? vb[i] : 0;
-		if (ai < bi) return true;
-		if (ai > bi) return false;
+		if (ai < bi) return true; // 版本号部分比较，较小的版本号优先
+		if (ai > bi) return false; // 版本号部分比较，较大的版本号优先
 	}
 	return a < b;
 }

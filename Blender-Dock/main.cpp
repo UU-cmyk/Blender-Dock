@@ -34,7 +34,7 @@ int main(int argc, char** argv)
 		po::notify(vm);
 	}
 	catch (const std::exception& ex) {
-		std::cerr << "Command line parse error: " << ex.what() << "\n";
+		std::cerr << "命令行解析错误: " << ex.what() << "\n";
 		std::cerr << desc << "\n";
 		return 1;
 	}
@@ -45,7 +45,7 @@ int main(int argc, char** argv)
 
 	if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0)
 	{
-		std::cerr << "Failed to init curl global" << std::endl;
+		std::cerr << "无法初始化curl" << std::endl;
 		return 1;
 	}
 
