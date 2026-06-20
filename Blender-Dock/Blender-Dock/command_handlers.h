@@ -28,5 +28,5 @@ void handle_show_small_ver(const po::variables_map& vm);
 // 删除已安装的 Blender 版本（文件夹名称或部分匹配）
 void handle_delete(const po::variables_map& vm);
 
-// 处理 --name 选项（设置自定义名称）
-void handle_name(const po::variables_map& vm);
+// 处理 --rename 选项（重命名已安装的 Blender 版本文件夹）
+void handle_rename(const po::variables_map& vm);

@@ -252,12 +252,9 @@ void handle_download(const po::variables_map& vm, Config& cfg) {
 			verstr = vs.str();
 		}
 
-		// allow overriding target folder name via --name option
+		// derive target folder name from version or filename
 		std::string target_name;
-		if (vm.count("name")) target_name = vm["name"].as<std::string>();
-		if (target_name.empty()) {
-			target_name = std::string("Blender") + (verstr.empty() ? filename.substr(0, filename.find('.')) : verstr);
-		}
+		target_name = std::string("Blender") + (verstr.empty() ? filename.substr(0, filename.find('.')) : verstr);
 
 		std::cout << "Extracting to " << target_name << "...\n";
 		bool extracted = ZipExtractor::extractAndOrganize(outpath, outdir, target_name);
@@ -398,13 +395,58 @@ void handle_delete(const po::variables_map& vm) {
 	return;
 }
 
-void handle_name(const po::variables_map& vm) {
-	std::string name = vm["name"].as<std::string>();
-	if (name.empty()) {
-		std::cerr << "--name requires a value, e.g. --name=MyBlender\n";
+void handle_rename(const po::variables_map& vm) {
+	auto& vals = vm["rename"].as<std::vector<std::string>>();
+	if (vals.size() < 2) {
+		std::cerr << "--rename requires two arguments: <target-version> <new-name>, e.g. --rename Blender3.6 MyBlender\n";
 		exit(1);
 	}
-	std::cout << "Name: " << name << "\n";
+
+	std::string target = vals[0];
+	std::string new_name = vals[1];
+
+	std::filesystem::path exe_dir = get_executable_dir();
+	std::filesystem::path versions_dir = exe_dir / std::filesystem::path("versions");
+	if (!std::filesystem::exists(versions_dir)) {
+		std::cerr << "Versions directory not found: " << versions_dir.string() << "\n";
+		exit(1);
+	}
+
+	// find matching folder (exact or substring match)
+	std::vector<std::filesystem::path> candidates;
+	for (auto& e : std::filesystem::directory_iterator(versions_dir)) {
+		if (!e.is_directory()) continue;
+		std::string name = e.path().filename().string();
+		if (name == target || name.find(target) != std::string::npos) candidates.push_back(e.path());
+	}
+
+	if (candidates.empty()) {
+		std::cerr << "No matching Blender installation found for: " << target << "\n";
+		exit(1);
+	}
+
+	if (candidates.size() > 1) {
+		std::cerr << "Multiple matches found for '" << target << "' - please be more specific:\n";
+		for (const auto& p : candidates) std::cerr << "  " << p.filename().string() << "\n";
+		exit(1);
+	}
+
+	std::filesystem::path old_path = candidates[0];
+	std::filesystem::path new_path = old_path.parent_path() / new_name;
+
+	if (std::filesystem::exists(new_path)) {
+		std::cerr << "Target name already exists: " << new_path.string() << "\n";
+		exit(1);
+	}
+
+	std::error_code ec;
+	std::filesystem::rename(old_path, new_path, ec);
+	if (ec) {
+		std::cerr << "Failed to rename: " << old_path.string() << " -> " << new_path.string() << " (" << ec.message() << ")\n";
+		exit(1);
+	}
+
+	std::cout << "Renamed: " << old_path.filename().string() << " -> " << new_name << "\n";
 }
 
 void handle_show_all_ver() {

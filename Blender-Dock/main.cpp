@@ -24,7 +24,7 @@ int main(int argc, char** argv)
 		("show-all-ver", "列出主版本号")
 		("show-small-ver", po::value<std::string>(), "列出某个主版本的文件 (例如 3.6 或 Blender3.6)")
 		("download", po::value<std::string>(), "下载文件名或 URL")
-		("name", po::value<std::string>(), "自定义名称（独立选项，也可与 --download/--start/--delete 组合使用）")
+		("rename", po::value<std::vector<std::string>>()->multitoken(), "重命名已安装的 Blender 版本，例如 --rename Blender3.6 MyBlender")
 		("start", po::value<std::string>(), "启动 Blender 安装 (文件夹名称或部分匹配)")
 		("list-installed", "列出本地版本目录下已安装的 Blender 版本")
 		("delete", po::value<std::string>(), "删除已安装的 Blender 版本 (文件夹名称或部分匹配) ");
@@ -55,7 +55,7 @@ int main(int argc, char** argv)
 	ensure_workspace_structure();
 	Config cfg = ConfigManager::load();
 
-	// 操作选项（不含 --help 和 --name，--name 可作为修饰符与其他选项组合）
+	// 操作选项（不含 --help）
 	const std::vector<std::pair<std::string, std::function<void()>>> actions = {
 		{"config", [&]() { handle_config(vm, cfg); }},
 		{"list-installed", [&]() { handle_list_installed(vm); }},
@@ -63,10 +63,11 @@ int main(int argc, char** argv)
 		{"download", [&]() { handle_download(vm, cfg); }},
 		{"start", [&]() { handle_start(vm); }},
 		{"show-all-ver", [&]() { handle_show_all_ver(); }},
-		{"show-small-ver", [&]() { handle_show_small_ver(vm); }}
+		{"show-small-ver", [&]() { handle_show_small_ver(vm); }},
+		{"rename", [&]() { handle_rename(vm); }}
 	};
 
-	// 主操作选项列表（不包含 --name，它可作为修饰符与其他选项组合）
+	// 主操作选项列表
 	std::vector<std::string> chosen_main;
 	for (const auto& [name, _] : actions) {
 		if (vm.count(name)) chosen_main.push_back("--" + name);
@@ -81,14 +82,10 @@ int main(int argc, char** argv)
 		return 1;
 	}
 
-	// 如果同时指定了 --name 和其他选项，优先执行其他选项，--name 作为修饰符由对应 handler 自行处理
 	if (chosen_main.size() == 1) {
 		for (const auto& [name, handler] : actions) {
 			if (vm.count(name)) { handler(); break; }
 		}
-	} else if (vm.count("name")) {
-		// 只有 --name 一个选项时，独立执行
-		handle_name(vm);
 	} else {
 		// 未指定任何操作，打印帮助信息
 		std::cout << desc << "\n";
